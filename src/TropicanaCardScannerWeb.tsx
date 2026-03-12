@@ -73,10 +73,22 @@ const TITLE_ROI: Roi = { x: 0.05, y: 0.02, w: 0.58, h: 0.22 };
 const SEMIS_ROI: Roi = { x: 0.03, y: 0.66, w: 0.3, h: 0.24 };
 const BODY_ROI: Roi = { x: 0.05, y: 0.28, w: 0.62, h: 0.28 };
 
-const MIN_TITLE_SCORE = 0.58;
-const MIN_SEMIS_SCORE = 0.54;
-const MIN_BODY_SCORE = 0.5;
-const MIN_TOTAL_SCORE = 0.57;
+const MIN_TITLE_SCORE = 0.43;
+const MIN_SEMIS_SCORE = 0.4;
+const MIN_BODY_SCORE = 0.38;
+const MIN_TOTAL_SCORE = 0.46;
+
+const ROI_JITTERS: Array<{ dx: number; dy: number; scale: number }> = [
+  { dx: 0, dy: 0, scale: 1 },
+  { dx: -0.06, dy: 0, scale: 1 },
+  { dx: 0.06, dy: 0, scale: 1 },
+  { dx: 0, dy: -0.06, scale: 1 },
+  { dx: 0, dy: 0.06, scale: 1 },
+  { dx: -0.04, dy: -0.04, scale: 1 },
+  { dx: 0.04, dy: 0.04, scale: 1 },
+  { dx: 0, dy: 0, scale: 0.9 },
+  { dx: 0, dy: 0, scale: 1.1 },
+];
 
 const CONFIRM_WINDOW_MS = 2200;
 const DEDUPE_COOLDOWN_MS = 1800;
@@ -147,14 +159,37 @@ function computeHashes(cardCanvas: HTMLCanvasElement, scratchCanvas: HTMLCanvasE
   };
 }
 
-function evaluateDetection(current: TemplateHashes, templates: LoadedTemplate[]): DetectionResult | null {
-  let best: DetectionResult | null = null;
+function clamp(value: number, min: number, max: number) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function jitterRoi(base: Roi, dx: number, dy: number, scale: number): Roi {
+  const w = clamp(base.w * scale, 0.08, 0.98);
+  const h = clamp(base.h * scale, 0.08, 0.98);
+  const x = clamp(base.x + dx - (w - base.w) / 2, 0, 1 - w);
+  const y = clamp(base.y + dy - (h - base.h) / 2, 0, 1 - h);
+  return { x, y, w, h };
+}
+
+function bestRoiSimilarity(cardCanvas: HTMLCanvasElement, baseRoi: Roi, templateHash: Uint8Array, scratchCanvas: HTMLCanvasElement) {
+  let best = 0;
+  for (const jitter of ROI_JITTERS) {
+    const roi = jitterRoi(baseRoi, jitter.dx, jitter.dy, jitter.scale);
+    const currentHash = extractDHash(cardCanvas, roi, scratchCanvas);
+    const score = hashSimilarity(currentHash, templateHash);
+    if (score > best) best = score;
+  }
+  return best;
+}
+
+function evaluateDetection(cardCanvas: HTMLCanvasElement, scratchCanvas: HTMLCanvasElement, templates: LoadedTemplate[]): DetectionResult | null {
+  const candidates: DetectionResult[] = [];
 
   for (const template of templates) {
-    const titleScore = hashSimilarity(current.title, template.hashes.title);
-    const semisScore = hashSimilarity(current.semis, template.hashes.semis);
-    const bodyScore = hashSimilarity(current.body, template.hashes.body);
-    const score = titleScore * 0.35 + semisScore * 0.45 + bodyScore * 0.2;
+    const titleScore = bestRoiSimilarity(cardCanvas, TITLE_ROI, template.hashes.title, scratchCanvas);
+    const semisScore = bestRoiSimilarity(cardCanvas, SEMIS_ROI, template.hashes.semis, scratchCanvas);
+    const bodyScore = bestRoiSimilarity(cardCanvas, BODY_ROI, template.hashes.body, scratchCanvas);
+    const score = titleScore * 0.25 + semisScore * 0.55 + bodyScore * 0.2;
 
     const valid =
       titleScore >= MIN_TITLE_SCORE &&
@@ -163,10 +198,16 @@ function evaluateDetection(current: TemplateHashes, templates: LoadedTemplate[])
       score >= MIN_TOTAL_SCORE;
 
     if (!valid) continue;
+    candidates.push({ match: template, score, titleScore, semisScore, bodyScore });
+  }
 
-    if (!best || score > best.score) {
-      best = { match: template, score, titleScore, semisScore, bodyScore };
-    }
+  if (candidates.length === 0) return null;
+  candidates.sort((a, b) => b.score - a.score);
+  const best = candidates[0];
+  const second = candidates[1];
+
+  if (second && best.score - second.score < 0.015 && Math.abs(best.semisScore - second.semisScore) < 0.02) {
+    return null;
   }
 
   return best;
@@ -391,8 +432,7 @@ export default function TropicanaCardScannerWeb() {
     const cardCanvas = cardCanvasRef.current;
     if (!cardCanvas || templates.length === 0) return;
     if (!scratchCanvasRef.current) scratchCanvasRef.current = document.createElement("canvas");
-    const hashes = computeHashes(cardCanvas, scratchCanvasRef.current);
-    const detection = evaluateDetection(hashes, templates);
+    const detection = evaluateDetection(cardCanvas, scratchCanvasRef.current, templates);
     processCandidate(detection, source);
   };
 
