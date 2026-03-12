@@ -3,52 +3,6 @@
     build:
       context: .
       dockerfile: Dockerfile
-    expose:
-      - "80"
-    networks:
-      - card-reader-network
-    restart: unless-stopped
-
-  caddy:
-    image: caddy:2.8-alpine
-    depends_on:
-      - card-reader
-    command: >
-      sh -c '
-      {
-        echo "$APP_DOMAIN {";
-        echo "  encode zstd gzip";
-        echo "  reverse_proxy card-reader:80";
-        echo "  tls {";
-        echo "    issuer acme {";
-        if [ -n "$LETSENCRYPT_EMAIL" ]; then
-          echo "      email $LETSENCRYPT_EMAIL";
-        fi;
-        echo "      disable_http_challenge";
-        echo "    }";
-        echo "  }";
-        echo "}";
-      } > /etc/caddy/Caddyfile;
-      exec caddy run --config /etc/caddy/Caddyfile --adapter caddyfile
-      '
     ports:
-      - "0.0.0.0:${APP_HTTPS_PORT:-18443}:443"
-    environment:
-      - APP_DOMAIN=${APP_DOMAIN:-reader.marcgrabel.cc}
-      - LETSENCRYPT_EMAIL=${LETSENCRYPT_EMAIL:-}
-    volumes:
-      - caddy_data:/data
-      - caddy_config:/config
-    networks:
-      - card-reader-network
+      - "0.0.0.0:${APP_WEB_PORT:-18080}:80"
     restart: unless-stopped
-
-networks:
-  card-reader-network:
-    name: card-reader-network
-    driver: bridge
-
-volumes:
-  caddy_data:
-  caddy_config:
-
