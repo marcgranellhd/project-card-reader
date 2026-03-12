@@ -69,6 +69,16 @@ type DetectionResult = {
   semisGap: number;
 };
 
+type CardPresenceMetrics = {
+  valid: boolean;
+  score: number;
+  darkRatio: number;
+  textEdgeRatio: number;
+  boxWhiteness: number;
+  boxContrast: number;
+  reason: string;
+};
+
 type TrainingSample = {
   id: string;
   cardId: string;
@@ -94,6 +104,8 @@ const TITLE_ROI: Roi = { x: 0.05, y: 0.02, w: 0.58, h: 0.22 };
 const SEMIS_ROI: Roi = { x: 0.02, y: 0.64, w: 0.26, h: 0.24 };
 const BODY_ROI: Roi = { x: 0.05, y: 0.28, w: 0.62, h: 0.28 };
 const NUMBER_ROI: Roi = { x: 0.035, y: 0.74, w: 0.18, h: 0.12 };
+const CARD_TEXT_ROI: Roi = { x: 0.04, y: 0.03, w: 0.66, h: 0.58 };
+const CARD_WHITE_BOX_ROI: Roi = { x: 0.02, y: 0.67, w: 0.96, h: 0.2 };
 
 const MIN_TITLE_SCORE = 0.42;
 const MIN_SEMIS_SCORE = 0.4;
@@ -127,6 +139,12 @@ const MIN_SEMIS_GAP = 0.025;
 
 const FAST_CONFIRM_SCORE = 0.66;
 const FAST_CONFIRM_NUMBER = 0.66;
+
+const MIN_CARD_DARK_RATIO = 0.22;
+const MIN_CARD_TEXT_EDGE_RATIO = 0.085;
+const MIN_CARD_BOX_WHITE_RATIO = 0.11;
+const MIN_CARD_BOX_CONTRAST = 18;
+const MIN_CARD_PRESENCE_SCORE = 0.5;
 
 const CONFIRM_WINDOW_MS = 2600;
 const DEDUPE_COOLDOWN_MS = 1800;
@@ -328,6 +346,119 @@ function bestRoiPatchSimilarity(
   return best;
 }
 
+function analyzeRoiTone(
+  cardCanvas: HTMLCanvasElement,
+  roi: Roi,
+  scratchCanvas: HTMLCanvasElement,
+  width: number,
+  height: number,
+) {
+  scratchCanvas.width = width;
+  scratchCanvas.height = height;
+  const ctx = scratchCanvas.getContext("2d");
+  if (!ctx) {
+    return {
+      darkRatio: 0,
+      brightRatio: 0,
+      edgeRatio: 0,
+      contrast: 0,
+    };
+  }
+
+  const sx = Math.round(cardCanvas.width * roi.x);
+  const sy = Math.round(cardCanvas.height * roi.y);
+  const sw = Math.max(1, Math.round(cardCanvas.width * roi.w));
+  const sh = Math.max(1, Math.round(cardCanvas.height * roi.h));
+
+  ctx.clearRect(0, 0, width, height);
+  ctx.drawImage(cardCanvas, sx, sy, sw, sh, 0, 0, width, height);
+  const image = ctx.getImageData(0, 0, width, height);
+  const data = image.data;
+  const gray = new Float32Array(width * height);
+
+  let dark = 0;
+  let bright = 0;
+  let mean = 0;
+  for (let i = 0, p = 0; i < data.length; i += 4, p += 1) {
+    const value = (data[i] * 299 + data[i + 1] * 587 + data[i + 2] * 114) / 1000;
+    gray[p] = value;
+    mean += value;
+    if (value < 118) dark += 1;
+    if (value > 178) bright += 1;
+  }
+  mean /= gray.length || 1;
+
+  let variance = 0;
+  for (let i = 0; i < gray.length; i += 1) {
+    const d = gray[i] - mean;
+    variance += d * d;
+  }
+  const contrast = Math.sqrt(variance / (gray.length || 1));
+
+  let strongEdges = 0;
+  let edgeChecks = 0;
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const center = gray[y * width + x];
+      if (x + 1 < width) {
+        if (Math.abs(center - gray[y * width + x + 1]) > 24) strongEdges += 1;
+        edgeChecks += 1;
+      }
+      if (y + 1 < height) {
+        if (Math.abs(center - gray[(y + 1) * width + x]) > 24) strongEdges += 1;
+        edgeChecks += 1;
+      }
+    }
+  }
+
+  return {
+    darkRatio: dark / (gray.length || 1),
+    brightRatio: bright / (gray.length || 1),
+    edgeRatio: strongEdges / (edgeChecks || 1),
+    contrast,
+  };
+}
+
+function evaluateCardPresence(cardCanvas: HTMLCanvasElement, scratchCanvas: HTMLCanvasElement): CardPresenceMetrics {
+  const global = analyzeRoiTone(cardCanvas, { x: 0, y: 0, w: 1, h: 1 }, scratchCanvas, 128, 170);
+  const text = analyzeRoiTone(cardCanvas, CARD_TEXT_ROI, scratchCanvas, 112, 96);
+  const whiteBox = analyzeRoiTone(cardCanvas, CARD_WHITE_BOX_ROI, scratchCanvas, 136, 48);
+
+  const darkScore = clamp((global.darkRatio - 0.16) / (0.5 - 0.16), 0, 1);
+  const textScore = clamp((text.edgeRatio - 0.045) / (0.19 - 0.045), 0, 1);
+  const boxWhiteScore = clamp((whiteBox.brightRatio - 0.06) / (0.34 - 0.06), 0, 1);
+  const boxContrastScore = clamp((whiteBox.contrast - 10) / (46 - 10), 0, 1);
+  const score = darkScore * 0.26 + textScore * 0.36 + boxWhiteScore * 0.22 + boxContrastScore * 0.16;
+
+  let reason = "Patron de tarjeta insuficiente.";
+  if (global.darkRatio < MIN_CARD_DARK_RATIO) {
+    reason = "Fondo demasiado claro. No parece tarjeta.";
+  } else if (text.edgeRatio < MIN_CARD_TEXT_EDGE_RATIO) {
+    reason = "No se detecta suficiente texto impreso.";
+  } else if (whiteBox.brightRatio < MIN_CARD_BOX_WHITE_RATIO) {
+    reason = "No aparece la banda blanca inferior de la tarjeta.";
+  } else if (whiteBox.contrast < MIN_CARD_BOX_CONTRAST) {
+    reason = "Contraste bajo en la zona inferior.";
+  }
+
+  const valid =
+    global.darkRatio >= MIN_CARD_DARK_RATIO &&
+    text.edgeRatio >= MIN_CARD_TEXT_EDGE_RATIO &&
+    whiteBox.brightRatio >= MIN_CARD_BOX_WHITE_RATIO &&
+    whiteBox.contrast >= MIN_CARD_BOX_CONTRAST &&
+    score >= MIN_CARD_PRESENCE_SCORE;
+
+  return {
+    valid,
+    score,
+    darkRatio: global.darkRatio,
+    textEdgeRatio: text.edgeRatio,
+    boxWhiteness: whiteBox.brightRatio,
+    boxContrast: whiteBox.contrast,
+    reason,
+  };
+}
+
 function evaluateDetection(cardCanvas: HTMLCanvasElement, scratchCanvas: HTMLCanvasElement, templates: LoadedTemplate[]): DetectionResult | null {
   const templateCandidates: DetectionResult[] = [];
 
@@ -460,6 +591,9 @@ export default function TropicanaCardScannerWeb() {
   const [debugSemis, setDebugSemis] = useState(0);
   const [debugBody, setDebugBody] = useState(0);
   const [debugNumber, setDebugNumber] = useState(0);
+  const [debugCardPresence, setDebugCardPresence] = useState(0);
+  const [debugCardText, setDebugCardText] = useState(0);
+  const [debugCardBox, setDebugCardBox] = useState(0);
 
   const totals = useMemo(() => {
     return history.reduce<Record<string, number>>((acc, item) => {
@@ -646,10 +780,11 @@ export default function TropicanaCardScannerWeb() {
     ]);
   };
 
-  const processCandidate = (detection: DetectionResult | null, source: "camera" | "image") => {
+  const processCandidate = (detection: DetectionResult | null, source: "camera" | "image", noMatchStatus?: string) => {
     if (!detection) {
       setCurrentMatch(null);
-      if (source === "camera") setStatus("Escaneando... sin coincidencia valida.");
+      if (source === "camera") setStatus(noMatchStatus || "Escaneando... sin coincidencia valida.");
+      if (source === "image" && noMatchStatus) setStatus(noMatchStatus);
       if (pendingRef.current && Date.now() - pendingRef.current.at > CONFIRM_WINDOW_MS) pendingRef.current = null;
       setDebugBest("--");
       setDebugScore(0);
@@ -695,6 +830,16 @@ export default function TropicanaCardScannerWeb() {
     const cardCanvas = cardCanvasRef.current;
     if (!cardCanvas || templates.length === 0) return;
     if (!scratchCanvasRef.current) scratchCanvasRef.current = document.createElement("canvas");
+    const cardPresence = evaluateCardPresence(cardCanvas, scratchCanvasRef.current);
+    setDebugCardPresence(Math.round(cardPresence.score * 100));
+    setDebugCardText(Math.round(cardPresence.textEdgeRatio * 100));
+    setDebugCardBox(Math.round(cardPresence.boxWhiteness * 100));
+
+    if (!cardPresence.valid) {
+      processCandidate(null, source, source === "camera" ? cardPresence.reason : `Imagen descartada: ${cardPresence.reason}`);
+      return;
+    }
+
     const detection = evaluateDetection(cardCanvas, scratchCanvasRef.current, templates);
     processCandidate(detection, source);
   };
@@ -1046,7 +1191,7 @@ export default function TropicanaCardScannerWeb() {
                       <Button onClick={clearHistory} variant="outline" className="rounded-2xl"><Trash2 className="mr-2 h-4 w-4" />Limpiar lista</Button>
                       <Button onClick={copySummary} variant="outline" className="rounded-2xl"><Copy className="mr-2 h-4 w-4" />Copiar resumen</Button>
                     </div>
-                    <div className="mt-4 rounded-2xl bg-emerald-50 px-4 py-3 text-sm text-emerald-900">Compara titulo + cuerpo + fila de semis y da peso fuerte a la casilla del numero del pack. Solo cuenta con 2-3 lecturas seguidas segun confianza.</div>
+                    <div className="mt-4 rounded-2xl bg-emerald-50 px-4 py-3 text-sm text-emerald-900">Primero valida que realmente haya una tarjeta (texto + banda blanca inferior + contraste). Luego clasifica pack y solo cuenta con 2-3 lecturas seguidas.</div>
                   </CardContent>
                 </Card>
 
@@ -1054,6 +1199,9 @@ export default function TropicanaCardScannerWeb() {
                   <CardContent className="p-4">
                     <div className="text-sm font-semibold text-slate-700">Debug detector</div>
                     <div className="mt-3 space-y-2 text-sm text-slate-700">
+                      <div className="flex items-center justify-between rounded-2xl bg-slate-50 px-3 py-2"><span>Validez tarjeta</span><span className="font-semibold">{debugCardPresence}%</span></div>
+                      <div className="flex items-center justify-between rounded-2xl bg-slate-50 px-3 py-2"><span>Texto visible</span><span>{debugCardText}%</span></div>
+                      <div className="flex items-center justify-between rounded-2xl bg-slate-50 px-3 py-2"><span>Caja blanca</span><span>{debugCardBox}%</span></div>
                       <div className="flex items-center justify-between rounded-2xl bg-slate-50 px-3 py-2"><span>Mejor plantilla</span><span className="font-semibold">{debugBest}</span></div>
                       <div className="flex items-center justify-between rounded-2xl bg-slate-50 px-3 py-2"><span>Titulo</span><span>{debugTitle}%</span></div>
                       <div className="flex items-center justify-between rounded-2xl bg-slate-50 px-3 py-2"><span>N semis</span><span>{debugSemis}%</span></div>
