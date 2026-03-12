@@ -113,7 +113,17 @@ type OcrWorker = Awaited<ReturnType<typeof Tesseract.createWorker>>;
 
 type DetectionHints = {
   semisPack: number | null;
+  hasBrand?: boolean;
 };
+
+type SemisRoi = { x: number; y: number; w: number; h: number };
+
+const SEMIS_ROI_VARIANTS: SemisRoi[] = [
+  { x: 0.03, y: 0.69, w: 0.28, h: 0.23 },
+  { x: 0.02, y: 0.63, w: 0.3, h: 0.25 },
+  { x: 0.04, y: 0.72, w: 0.24, h: 0.2 },
+  { x: 0.01, y: 0.66, w: 0.32, h: 0.28 },
+];
 
 function normalizeCommonOcrTypos(text: string) {
   return normalizeText(text)
@@ -203,31 +213,22 @@ function enhanceImageForOCR(ctx: CanvasRenderingContext2D, width: number, height
   ctx.putImageData(image, 0, 0);
 }
 
-function buildSemisRoiCanvases(source: HTMLCanvasElement) {
-  const variants = [
-    { x: 0.03, y: 0.69, w: 0.28, h: 0.23 },
-    { x: 0.02, y: 0.63, w: 0.3, h: 0.25 },
-    { x: 0.04, y: 0.72, w: 0.24, h: 0.2 },
-    { x: 0.01, y: 0.66, w: 0.32, h: 0.28 },
-  ];
+function buildSemisRoiCanvas(source: HTMLCanvasElement, area: SemisRoi) {
+  const sx = Math.round(source.width * area.x);
+  const sy = Math.round(source.height * area.y);
+  const sw = Math.round(source.width * area.w);
+  const sh = Math.round(source.height * area.h);
 
-  return variants.map((area) => {
-    const sx = Math.round(source.width * area.x);
-    const sy = Math.round(source.height * area.y);
-    const sw = Math.round(source.width * area.w);
-    const sh = Math.round(source.height * area.h);
+  const roi = document.createElement("canvas");
+  roi.width = Math.max(1, sw * 3);
+  roi.height = Math.max(1, sh * 3);
+  const roiCtx = roi.getContext("2d");
+  if (!roiCtx) return roi;
 
-    const roi = document.createElement("canvas");
-    roi.width = Math.max(1, sw * 3);
-    roi.height = Math.max(1, sh * 3);
-    const roiCtx = roi.getContext("2d");
-    if (!roiCtx) return { canvas: roi, label: `${area.x},${area.y}` };
-
-    roiCtx.imageSmoothingEnabled = false;
-    roiCtx.drawImage(source, sx, sy, sw, sh, 0, 0, roi.width, roi.height);
-    enhanceImageForOCR(roiCtx, roi.width, roi.height);
-    return { canvas: roi, label: `${area.x},${area.y}` };
-  });
+  roiCtx.imageSmoothingEnabled = false;
+  roiCtx.drawImage(source, sx, sy, sw, sh, 0, 0, roi.width, roi.height);
+  enhanceImageForOCR(roiCtx, roi.width, roi.height);
+  return roi;
 }
 
 function normalizeText(text: string) {
@@ -306,7 +307,8 @@ function parseSemisPack(text: string): number | null {
 }
 
 function detectCard(rawText: string, hints?: DetectionHints): CardMatch | null {
-  if (!isTropicanaCherryLike(rawText)) return null;
+  const hasBrand = hints?.hasBrand ?? isTropicanaCherryLike(rawText);
+  if (!hasBrand) return null;
 
   const pack = hints?.semisPack ?? parseSemisPack(rawText);
   if (!pack) return null;
@@ -375,6 +377,11 @@ export default function TropicanaCardScannerWeb() {
   const audioContextRef = useRef<AudioContext | null>(null);
   const isBusyRef = useRef(false);
   const lastAcceptedRef = useRef<{ id: string; at: number } | null>(null);
+  const pendingMatchRef = useRef<{ id: string; count: number; at: number } | null>(null);
+  const brandConfirmedUntilRef = useRef(0);
+  const roiVariantIndexRef = useRef(0);
+  const frameTickRef = useRef(0);
+  const lastFullTextRef = useRef("");
   const ocrWorkerRef = useRef<OcrWorker | null>(null);
   const ocrWorkerInitRef = useRef<Promise<OcrWorker> | null>(null);
   const digitsWorkerRef = useRef<OcrWorker | null>(null);
@@ -385,7 +392,7 @@ export default function TropicanaCardScannerWeb() {
   const [status, setStatus] = useState("Inicializando cámara automática...");
   const [recognizedText, setRecognizedText] = useState("");
   const [currentMatch, setCurrentMatch] = useState<string | null>(null);
-  const [intervalMs] = useState(900);
+  const [intervalMs] = useState(650);
   const [history, setHistory] = useState<ScanHistoryItem[]>([]);
   const [cameraSupported, setCameraSupported] = useState(() => Boolean(navigator.mediaDevices?.getUserMedia));
   const [secureContext, setSecureContext] = useState(() => window.isSecureContext || window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1");
@@ -507,6 +514,32 @@ export default function TropicanaCardScannerWeb() {
     ]);
   };
 
+  const addScanWithStability = (match: { id: string; label: string }, rawText: string, source: "camera" | "image") => {
+    if (source !== "camera") {
+      addScan(match, rawText, source);
+      return;
+    }
+
+    const now = Date.now();
+    const pending = pendingMatchRef.current;
+
+    if (pending && pending.id === match.id && now - pending.at < 2300) {
+      const nextCount = pending.count + 1;
+      pendingMatchRef.current = { id: match.id, count: nextCount, at: now };
+
+      if (nextCount >= 2) {
+        pendingMatchRef.current = null;
+        addScan(match, rawText, source);
+      } else {
+        setStatus(`Posible ${match.label}. Confirmando lectura...`);
+      }
+      return;
+    }
+
+    pendingMatchRef.current = { id: match.id, count: 1, at: now };
+    setStatus(`Posible ${match.label}. Confirmando lectura...`);
+  };
+
   const getOcrWorker = async () => {
     if (ocrWorkerRef.current) return ocrWorkerRef.current;
 
@@ -563,26 +596,33 @@ export default function TropicanaCardScannerWeb() {
   const processDetectedText = (text: string, source: "camera" | "image", confidence?: number, hints?: DetectionHints) => {
     const cleanText = text.trim();
     setRecognizedText(cleanText);
+    lastFullTextRef.current = cleanText;
     setOcrConfidence(typeof confidence === "number" ? Math.round(confidence) : null);
-    const hasBrand = isTropicanaCherryLike(cleanText);
+
+    const hasBrand = hints?.hasBrand ?? isTropicanaCherryLike(cleanText);
     const packFromSemis = hints?.semisPack ?? parseSemisPack(cleanText);
     setDebugHasBrand(hasBrand);
     setDebugPack(packFromSemis);
 
-    const match = detectCard(cleanText, { semisPack: packFromSemis });
+    const match = detectCard(cleanText, { semisPack: packFromSemis, hasBrand });
     if (match) {
-      addScan(match, cleanText, source);
+      addScanWithStability(match, cleanText, source);
+      return;
+    }
+
+    setCurrentMatch(null);
+    if (source === "camera" && pendingMatchRef.current && Date.now() - pendingMatchRef.current.at > 2300) {
+      pendingMatchRef.current = null;
+    }
+
+    if (!cleanText) {
+      setStatus(source === "camera" ? "Escaneando... sin texto legible, acerca la tarjeta y mejora la luz." : "La imagen no tiene texto legible para OCR.");
+    } else if (!hasBrand) {
+      setStatus('Leo texto, pero no aparece "Tropicana Cherry" con claridad.');
+    } else if (!packFromSemis) {
+      setStatus('Veo Tropicana Cherry, pero no logro leer el numero de "N? semis".');
     } else {
-      setCurrentMatch(null);
-      if (!cleanText) {
-        setStatus(source === "camera" ? "Escaneando... sin texto legible, acerca la tarjeta y mejora la luz." : "La imagen no tiene texto legible para OCR.");
-      } else if (!hasBrand) {
-        setStatus("Leo texto, pero no aparece “Tropicana Cherry” con claridad.");
-      } else if (!packFromSemis) {
-        setStatus("Veo Tropicana Cherry, pero no logro leer el número de “Nº semis”.");
-      } else {
-        setStatus(source === "camera" ? "Escaneando... todavía no veo una tarjeta reconocible." : "La imagen se leyó, pero no coincide con ninguna tarjeta conocida.");
-      }
+      setStatus(source === "camera" ? "Escaneando... todavia no veo una tarjeta reconocible." : "La imagen se leyo, pero no coincide con ninguna tarjeta conocida.");
     }
   };
 
@@ -592,15 +632,23 @@ export default function TropicanaCardScannerWeb() {
 
     isBusyRef.current = true;
     try {
-      const worker = await getOcrWorker();
       const digitsWorker = await getDigitsWorker();
-      const { data } = await worker.recognize(canvas);
-      const semisRoiVariants = buildSemisRoiCanvases(canvas);
+      frameTickRef.current += 1;
+
+      const primaryIndex = roiVariantIndexRef.current % SEMIS_ROI_VARIANTS.length;
+      roiVariantIndexRef.current = (roiVariantIndexRef.current + 1) % SEMIS_ROI_VARIANTS.length;
+
+      const roiAreas = [
+        SEMIS_ROI_VARIANTS[primaryIndex],
+        SEMIS_ROI_VARIANTS[(primaryIndex + 1) % SEMIS_ROI_VARIANTS.length],
+      ];
+
       let semisPack: number | null = null;
       const semisTexts: string[] = [];
 
-      for (const variant of semisRoiVariants) {
-        const semisResult = await digitsWorker.recognize(variant.canvas);
+      for (const area of roiAreas) {
+        const roiCanvas = buildSemisRoiCanvas(canvas, area);
+        const semisResult = await digitsWorker.recognize(roiCanvas);
         const semisText = (semisResult.data.text || "").trim();
         if (semisText) semisTexts.push(semisText);
 
@@ -611,10 +659,49 @@ export default function TropicanaCardScannerWeb() {
         }
       }
 
-      if (!semisPack) semisPack = parseSemisPack(data.text || "");
+      if (!semisPack && lastFullTextRef.current) {
+        semisPack = parseSemisPack(lastFullTextRef.current);
+      }
 
       setDebugSemisText(semisTexts.join(" | "));
-      processDetectedText(data.text || "", source, data.confidence, { semisPack });
+
+      let hasBrand = Date.now() < brandConfirmedUntilRef.current;
+      let fullTextForProcess = lastFullTextRef.current;
+      let confidenceForProcess: number | undefined;
+
+      const shouldRunFullOcr =
+        source === "image" ||
+        !hasBrand ||
+        frameTickRef.current % 5 === 0 ||
+        semisPack === null;
+
+      if (shouldRunFullOcr) {
+        const worker = await getOcrWorker();
+        const upperHeight = Math.round(canvas.height * 0.68);
+        const { data } = await worker.recognize(canvas, {
+          rectangle: {
+            left: 0,
+            top: 0,
+            width: canvas.width,
+            height: upperHeight,
+          },
+        });
+
+        fullTextForProcess = data.text || "";
+        confidenceForProcess = data.confidence;
+
+        if (isTropicanaCherryLike(fullTextForProcess)) {
+          hasBrand = true;
+          brandConfirmedUntilRef.current = Date.now() + 7000;
+        } else if (source === "image") {
+          hasBrand = false;
+          brandConfirmedUntilRef.current = 0;
+        } else {
+          hasBrand = Date.now() < brandConfirmedUntilRef.current;
+        }
+      }
+
+      processDetectedText(fullTextForProcess || "", source, confidenceForProcess, { semisPack, hasBrand });
       setLastError(null);
     } catch (error) {
       console.error(error);
@@ -640,7 +727,7 @@ export default function TropicanaCardScannerWeb() {
     const cropX = Math.round((video.videoWidth - cropWidth) / 2);
     const cropY = Math.round((video.videoHeight - cropHeight) / 2);
 
-    const targetWidth = 1280;
+    const targetWidth = 1024;
     const ratio = cropHeight / cropWidth;
     canvas.width = targetWidth;
     canvas.height = Math.max(1, Math.round(targetWidth * ratio));
@@ -662,7 +749,7 @@ export default function TropicanaCardScannerWeb() {
     void runOCRFromVideoFrame();
     scanTimerRef.current = window.setInterval(() => {
       void runOCRFromVideoFrame();
-    }, Math.max(700, intervalMs));
+    }, Math.max(500, intervalMs));
   };
 
   const startCamera = async () => {
@@ -702,6 +789,9 @@ export default function TropicanaCardScannerWeb() {
 
       setCameraReady(true);
       setPermissionState("granted");
+      pendingMatchRef.current = null;
+      brandConfirmedUntilRef.current = 0;
+      lastFullTextRef.current = "";
       setStatus("Cámara activa. Ya puedes mostrar una tarjeta.");
     } catch (error) {
       console.error(error);
@@ -729,8 +819,11 @@ export default function TropicanaCardScannerWeb() {
   const clearHistory = () => {
     setHistory([]);
     lastAcceptedRef.current = null;
+    pendingMatchRef.current = null;
     setCurrentMatch(null);
     setRecognizedText("");
+    lastFullTextRef.current = "";
+    brandConfirmedUntilRef.current = 0;
     setOcrConfidence(null);
     setDebugHasBrand(false);
     setDebugPack(null);
