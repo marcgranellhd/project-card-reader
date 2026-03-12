@@ -80,11 +80,68 @@ const DETECTOR_TESTS: DetectorTest[] = [
     expectedId: "tropicana-cherry-100",
   },
   {
+    name: "Detecta pack 100 con OCR ambiguo",
+    input: "tropicana cherry l00",
+    expectedId: "tropicana-cherry-100",
+  },
+  {
+    name: "Detecta pack 10 con O en vez de cero",
+    input: "tropicana cherry x1o",
+    expectedId: "tropicana-cherry-10",
+  },
+  {
     name: "No detecta texto irrelevante",
     input: "banana split fertilizante 500ml",
     expectedId: null,
   },
 ];
+
+type OcrWorker = Awaited<ReturnType<typeof Tesseract.createWorker>>;
+
+function normalizeCommonOcrTypos(text: string) {
+  return normalizeText(text)
+    .replace(/\bcherrv\b/g, "cherry")
+    .replace(/\bchery\b/g, "cherry")
+    .replace(/\btropicana\b/g, "tropicana")
+    .replace(/\btropieana\b/g, "tropicana");
+}
+
+function normalizeAmbiguousNumbers(text: string) {
+  const tokens = normalizeText(text).split(" ").filter(Boolean);
+
+  return tokens
+    .map((token) => {
+      if (!/[a-z]/.test(token) || !/\d/.test(token)) return token;
+
+      return token
+        .replace(/o/g, "0")
+        .replace(/[il]/g, "1")
+        .replace(/s/g, "5")
+        .replace(/b/g, "8")
+        .replace(/z/g, "2");
+    })
+    .join(" ");
+}
+
+function enhanceImageForOCR(ctx: CanvasRenderingContext2D, width: number, height: number) {
+  const image = ctx.getImageData(0, 0, width, height);
+  const data = image.data;
+
+  for (let i = 0; i < data.length; i += 4) {
+    const gray = (data[i] * 299 + data[i + 1] * 587 + data[i + 2] * 114) / 1000;
+    let value = (gray - 128) * 1.45 + 128;
+
+    if (value > 170) value = 255;
+    else if (value < 60) value = 0;
+    else value = Math.max(0, Math.min(255, value));
+
+    data[i] = value;
+    data[i + 1] = value;
+    data[i + 2] = value;
+  }
+
+  ctx.putImageData(image, 0, 0);
+}
 
 function normalizeText(text: string) {
   return text
@@ -103,7 +160,7 @@ function scoreMatch(text: string, pattern: CardPattern) {
   if (!normalized) return 0;
 
   if (normalized.includes("tropicana")) score += 2;
-  if (normalized.includes("cherry") || normalized.includes("cherrv")) score += 2;
+  if (normalized.includes("cherry") || normalized.includes("cherrv") || normalized.includes("chery")) score += 2;
 
   for (const keyword of pattern.keywords) {
     if (normalized.includes(String(keyword))) score += 3;
@@ -120,16 +177,30 @@ function scoreMatch(text: string, pattern: CardPattern) {
 }
 
 function detectCard(rawText: string): CardMatch | null {
-  const normalized = normalizeText(rawText);
-  if (!normalized) return null;
+  const base = normalizeText(rawText);
+  if (!base) return null;
 
-  const ranked: CardMatch[] = CARD_PATTERNS.map((pattern) => ({
-    ...pattern,
-    score: scoreMatch(normalized, pattern),
-  })).sort((a, b) => b.score - a.score);
+  const variants = [
+    base,
+    normalizeCommonOcrTypos(rawText),
+    normalizeAmbiguousNumbers(rawText),
+    normalizeCommonOcrTypos(normalizeAmbiguousNumbers(rawText)),
+  ];
 
-  const best = ranked[0];
-  if (!best || best.score < 8) return null;
+  const uniqueVariants = [...new Set(variants.filter(Boolean))];
+
+  let best: CardMatch | null = null;
+  for (const variant of uniqueVariants) {
+    const ranked: CardMatch[] = CARD_PATTERNS.map((pattern) => ({
+      ...pattern,
+      score: scoreMatch(variant, pattern),
+    })).sort((a, b) => b.score - a.score);
+
+    if (!ranked[0]) continue;
+    if (!best || ranked[0].score > best.score) best = ranked[0];
+  }
+
+  if (!best || best.score < 7) return null;
   return best;
 }
 
@@ -185,6 +256,8 @@ export default function TropicanaCardScannerWeb() {
   const scanTimerRef = useRef<number | null>(null);
   const isBusyRef = useRef(false);
   const lastAcceptedRef = useRef<{ id: string; at: number } | null>(null);
+  const ocrWorkerRef = useRef<OcrWorker | null>(null);
+  const ocrWorkerInitRef = useRef<Promise<OcrWorker> | null>(null);
 
   const [cameraReady, setCameraReady] = useState(false);
   const [isRunning, setIsRunning] = useState(false);
@@ -198,6 +271,7 @@ export default function TropicanaCardScannerWeb() {
   const [permissionState, setPermissionState] = useState<PermissionStateLike>("unknown");
   const [lastError, setLastError] = useState<string | null>(null);
   const [isProcessingImage, setIsProcessingImage] = useState(false);
+  const [ocrConfidence, setOcrConfidence] = useState<number | null>(null);
 
   const totals = useMemo(() => {
     return history.reduce<Record<string, number>>((acc, item) => {
@@ -230,6 +304,12 @@ export default function TropicanaCardScannerWeb() {
     return () => {
       if (scanTimerRef.current) window.clearInterval(scanTimerRef.current);
       streamRef.current?.getTracks().forEach((track) => track.stop());
+
+      if (ocrWorkerRef.current) {
+        void ocrWorkerRef.current.terminate();
+        ocrWorkerRef.current = null;
+      }
+      ocrWorkerInitRef.current = null;
     };
   }, []);
 
@@ -251,6 +331,7 @@ export default function TropicanaCardScannerWeb() {
       videoRef.current.srcObject = null;
     }
     setCameraReady(false);
+    setOcrConfidence(null);
     setStatus("Cámara detenida.");
   };
 
@@ -279,16 +360,48 @@ export default function TropicanaCardScannerWeb() {
     ]);
   };
 
-  const processDetectedText = (text: string, source: "camera" | "image") => {
+  const getOcrWorker = async () => {
+    if (ocrWorkerRef.current) return ocrWorkerRef.current;
+
+    if (!ocrWorkerInitRef.current) {
+      setStatus("Inicializando OCR...");
+      ocrWorkerInitRef.current = (async () => {
+        const worker = await Tesseract.createWorker("eng", Tesseract.OEM.LSTM_ONLY, {
+          logger: () => {},
+        });
+
+        await worker.setParameters({
+          tessedit_pageseg_mode: Tesseract.PSM.SPARSE_TEXT,
+          preserve_interword_spaces: "1",
+          tessedit_char_whitelist: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789xX -",
+        });
+
+        ocrWorkerRef.current = worker;
+        return worker;
+      })().catch((error) => {
+        ocrWorkerInitRef.current = null;
+        throw error;
+      });
+    }
+
+    return ocrWorkerInitRef.current as Promise<OcrWorker>;
+  };
+
+  const processDetectedText = (text: string, source: "camera" | "image", confidence?: number) => {
     const cleanText = text.trim();
     setRecognizedText(cleanText);
+    setOcrConfidence(typeof confidence === "number" ? Math.round(confidence) : null);
 
     const match = detectCard(cleanText);
     if (match) {
       addScan(match, cleanText, source);
     } else {
       setCurrentMatch(null);
-      setStatus(source === "camera" ? "Escaneando... todavía no veo una tarjeta reconocible." : "La imagen se leyó, pero no coincide con ninguna tarjeta conocida.");
+      if (!cleanText) {
+        setStatus(source === "camera" ? "Escaneando... sin texto legible, acerca la tarjeta y mejora la luz." : "La imagen no tiene texto legible para OCR.");
+      } else {
+        setStatus(source === "camera" ? "Escaneando... todavía no veo una tarjeta reconocible." : "La imagen se leyó, pero no coincide con ninguna tarjeta conocida.");
+      }
     }
   };
 
@@ -298,10 +411,9 @@ export default function TropicanaCardScannerWeb() {
 
     isBusyRef.current = true;
     try {
-      const { data } = await Tesseract.recognize(canvas, "eng", {
-        logger: () => {},
-      });
-      processDetectedText(data.text || "", source);
+      const worker = await getOcrWorker();
+      const { data } = await worker.recognize(canvas);
+      processDetectedText(data.text || "", source, data.confidence);
       setLastError(null);
     } catch (error) {
       console.error(error);
@@ -322,11 +434,17 @@ export default function TropicanaCardScannerWeb() {
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
-    const targetWidth = 960;
-    const ratio = video.videoHeight / video.videoWidth;
+    const cropWidth = Math.round(video.videoWidth * 0.82);
+    const cropHeight = Math.round(video.videoHeight * 0.62);
+    const cropX = Math.round((video.videoWidth - cropWidth) / 2);
+    const cropY = Math.round((video.videoHeight - cropHeight) / 2);
+
+    const targetWidth = 1280;
+    const ratio = cropHeight / cropWidth;
     canvas.width = targetWidth;
-    canvas.height = Math.round(targetWidth * ratio);
-    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    canvas.height = Math.max(1, Math.round(targetWidth * ratio));
+    ctx.drawImage(video, cropX, cropY, cropWidth, cropHeight, 0, 0, canvas.width, canvas.height);
+    enhanceImageForOCR(ctx, canvas.width, canvas.height);
 
     await runOCRFromCanvas("camera");
   };
@@ -399,6 +517,7 @@ export default function TropicanaCardScannerWeb() {
     lastAcceptedRef.current = null;
     setCurrentMatch(null);
     setRecognizedText("");
+    setOcrConfidence(null);
     setLastError(null);
     setStatus("Lista limpiada. Puedes volver a escanear.");
   };
@@ -444,6 +563,7 @@ export default function TropicanaCardScannerWeb() {
       canvas.height = Math.max(1, Math.round(image.height * scale));
 
       ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
+      enhanceImageForOCR(ctx, canvas.width, canvas.height);
       await runOCRFromCanvas("image");
       URL.revokeObjectURL(imageUrl);
     } catch (error) {
@@ -529,6 +649,10 @@ export default function TropicanaCardScannerWeb() {
                       <div className="flex items-center justify-between rounded-2xl bg-slate-50 px-3 py-2">
                         <span>Permiso</span>
                         <Badge variant={permissionState === "granted" ? "default" : permissionState === "denied" ? "destructive" : "secondary"} className="rounded-xl">{permissionState}</Badge>
+                      </div>
+                      <div className="flex items-center justify-between rounded-2xl bg-slate-50 px-3 py-2">
+                        <span>Confianza OCR</span>
+                        <Badge variant="secondary" className="rounded-xl">{ocrConfidence !== null ? `${ocrConfidence}%` : "--"}</Badge>
                       </div>
                     </div>
                   </div>
