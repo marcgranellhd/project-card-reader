@@ -1,0 +1,37 @@
+services:
+  card-reader:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    expose:
+      - "80"
+    networks:
+      - card-reader-network
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2.8-alpine
+    depends_on:
+      - card-reader
+    ports:
+      - "0.0.0.0:80:80"
+      - "0.0.0.0:443:443"
+    environment:
+      - APP_DOMAIN=${APP_DOMAIN:-localhost}
+      - LETSENCRYPT_EMAIL=${LETSENCRYPT_EMAIL:-}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - card-reader-network
+    restart: unless-stopped
+
+networks:
+  card-reader-network:
+    name: card-reader-network
+    driver: bridge
+
+volumes:
+  caddy_data:
+  caddy_config:

@@ -1,0 +1,8 @@
+{
+  email {$LETSENCRYPT_EMAIL}
+}
+
+{$APP_DOMAIN:localhost} {
+  encode zstd gzip
+  reverse_proxy card-reader:80
+}
