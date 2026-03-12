@@ -4,7 +4,6 @@ import {
   ScanLine,
   Trash2,
   Play,
-  Square,
   RotateCcw,
   CheckCircle2,
   AlertCircle,
@@ -17,7 +16,6 @@ import Tesseract from "tesseract.js";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
 
 type CardPattern = {
@@ -55,39 +53,49 @@ const CARD_PATTERNS: CardPattern[] = [
 
 const DETECTOR_TESTS: DetectorTest[] = [
   {
-    name: "Detecta pack 3 con texto limpio",
-    input: "Tropicana Cherry Pack de 3",
+    name: "Detecta pack 3 por campo semis",
+    input: "Tropicana Cherry N semis 3",
     expectedId: "tropicana-cherry-3",
   },
   {
     name: "Detecta pack 5 con OCR feote",
-    input: "tropicana cherrv de 5",
+    input: "tropicana cherrv n semis 5",
     expectedId: "tropicana-cherry-5",
   },
   {
-    name: "Detecta pack 10 con x10",
-    input: "TROPICANA CHERRY x10",
+    name: "Detecta pack 10 con semis",
+    input: "TROPICANA CHERRY semis 10",
     expectedId: "tropicana-cherry-10",
   },
   {
     name: "Detecta pack 25 aunque haya ruido",
-    input: "*** tropicana cherry pack 25 semillas ***",
+    input: "*** tropicana cherry nro semis: 25 semillas ***",
     expectedId: "tropicana-cherry-25",
   },
   {
     name: "Detecta pack 100",
-    input: "Tropicana Cherry 100",
+    input: "Tropicana Cherry N semis 100",
     expectedId: "tropicana-cherry-100",
   },
   {
     name: "Detecta pack 100 con OCR ambiguo",
-    input: "tropicana cherry l00",
+    input: "tropicana cherry n semis l00",
     expectedId: "tropicana-cherry-100",
   },
   {
     name: "Detecta pack 10 con O en vez de cero",
-    input: "tropicana cherry x1o",
+    input: "tropicana cherry semis 1o",
     expectedId: "tropicana-cherry-10",
+  },
+  {
+    name: "No detecta si falta campo semis",
+    input: "tropicana cherry pack 25",
+    expectedId: null,
+  },
+  {
+    name: "No detecta si no es tropicana cherry",
+    input: "n semis 25 banana kush",
+    expectedId: null,
   },
   {
     name: "No detecta texto irrelevante",
@@ -153,55 +161,57 @@ function normalizeText(text: string) {
     .trim();
 }
 
-function scoreMatch(text: string, pattern: CardPattern) {
-  let score = 0;
-  const normalized = normalizeText(text);
+function includesTropicanaCherry(text: string) {
+  const normalized = normalizeCommonOcrTypos(normalizeAmbiguousNumbers(text));
+  return normalized.includes("tropicana") && normalized.includes("cherry");
+}
 
-  if (!normalized) return 0;
+function parseSemisPack(text: string): number | null {
+  const normalized = normalizeCommonOcrTypos(normalizeAmbiguousNumbers(text));
+  if (!normalized) return null;
 
-  if (normalized.includes("tropicana")) score += 2;
-  if (normalized.includes("cherry") || normalized.includes("cherrv") || normalized.includes("chery")) score += 2;
+  const allowed = new Set(["3", "5", "10", "25", "100"]);
 
-  for (const keyword of pattern.keywords) {
-    if (normalized.includes(String(keyword))) score += 3;
+  const directPatterns = [
+    /(?:n\s*(?:o|0|ro)?\s*)?(?:semis|semi|semilla|semillas)\s*(?:de|:)?\s*(3|5|10|25|100)\b/,
+    /(?:3|5|10|25|100)\s*(?:semis|semi|semilla|semillas)\b/,
+  ];
+
+  for (const pattern of directPatterns) {
+    const found = normalized.match(pattern);
+    if (found?.[1]) return Number(found[1]);
+    if (found?.[0]) {
+      const num = found[0].match(/\b(3|5|10|25|100)\b/);
+      if (num?.[1]) return Number(num[1]);
+    }
   }
 
-  const packRegex = new RegExp(`(?:pack|pak|paq|x)?\\s*${pattern.pack}(?!\\d)`);
-  if (packRegex.test(normalized)) score += 6;
+  const tokens = normalized.split(" ").filter(Boolean);
+  const semisIndex = tokens.findIndex((token) => token.startsWith("semi"));
+  if (semisIndex === -1) return null;
 
-  if (normalized.includes(`de ${pattern.pack}`)) score += 4;
-  if (normalized.includes(`pack de ${pattern.pack}`)) score += 5;
-  if (normalized.includes(`x${pattern.pack}`)) score += 5;
+  const from = Math.max(0, semisIndex - 4);
+  const to = Math.min(tokens.length - 1, semisIndex + 4);
+  for (let i = from; i <= to; i += 1) {
+    if (allowed.has(tokens[i])) return Number(tokens[i]);
+  }
 
-  return score;
+  return null;
 }
 
 function detectCard(rawText: string): CardMatch | null {
-  const base = normalizeText(rawText);
-  if (!base) return null;
+  if (!includesTropicanaCherry(rawText)) return null;
 
-  const variants = [
-    base,
-    normalizeCommonOcrTypos(rawText),
-    normalizeAmbiguousNumbers(rawText),
-    normalizeCommonOcrTypos(normalizeAmbiguousNumbers(rawText)),
-  ];
+  const pack = parseSemisPack(rawText);
+  if (!pack) return null;
 
-  const uniqueVariants = [...new Set(variants.filter(Boolean))];
+  const pattern = CARD_PATTERNS.find((item) => item.pack === pack);
+  if (!pattern) return null;
 
-  let best: CardMatch | null = null;
-  for (const variant of uniqueVariants) {
-    const ranked: CardMatch[] = CARD_PATTERNS.map((pattern) => ({
-      ...pattern,
-      score: scoreMatch(variant, pattern),
-    })).sort((a, b) => b.score - a.score);
-
-    if (!ranked[0]) continue;
-    if (!best || ranked[0].score > best.score) best = ranked[0];
-  }
-
-  if (!best || best.score < 7) return null;
-  return best;
+  return {
+    ...pattern,
+    score: 100,
+  };
 }
 
 function getReadableCameraError(error: unknown, secureContext: boolean) {
@@ -254,6 +264,9 @@ export default function TropicanaCardScannerWeb() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const scanTimerRef = useRef<number | null>(null);
+  const feedbackTimerRef = useRef<number | null>(null);
+  const autoBootRef = useRef(false);
+  const audioContextRef = useRef<AudioContext | null>(null);
   const isBusyRef = useRef(false);
   const lastAcceptedRef = useRef<{ id: string; at: number } | null>(null);
   const ocrWorkerRef = useRef<OcrWorker | null>(null);
@@ -261,17 +274,18 @@ export default function TropicanaCardScannerWeb() {
 
   const [cameraReady, setCameraReady] = useState(false);
   const [isRunning, setIsRunning] = useState(false);
-  const [status, setStatus] = useState("Pulsa “Iniciar cámara” para empezar.");
+  const [status, setStatus] = useState("Inicializando cámara automática...");
   const [recognizedText, setRecognizedText] = useState("");
   const [currentMatch, setCurrentMatch] = useState<string | null>(null);
-  const [intervalMs, setIntervalMs] = useState(1200);
+  const [intervalMs] = useState(900);
   const [history, setHistory] = useState<ScanHistoryItem[]>([]);
-  const [cameraSupported, setCameraSupported] = useState(true);
-  const [secureContext, setSecureContext] = useState(true);
+  const [cameraSupported, setCameraSupported] = useState(() => Boolean(navigator.mediaDevices?.getUserMedia));
+  const [secureContext, setSecureContext] = useState(() => window.isSecureContext || window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1");
   const [permissionState, setPermissionState] = useState<PermissionStateLike>("unknown");
   const [lastError, setLastError] = useState<string | null>(null);
   const [isProcessingImage, setIsProcessingImage] = useState(false);
   const [ocrConfidence, setOcrConfidence] = useState<number | null>(null);
+  const [isFeedbackOn, setIsFeedbackOn] = useState(false);
 
   const totals = useMemo(() => {
     return history.reduce<Record<string, number>>((acc, item) => {
@@ -303,36 +317,52 @@ export default function TropicanaCardScannerWeb() {
 
     return () => {
       if (scanTimerRef.current) window.clearInterval(scanTimerRef.current);
+      if (feedbackTimerRef.current) window.clearTimeout(feedbackTimerRef.current);
       streamRef.current?.getTracks().forEach((track) => track.stop());
 
       if (ocrWorkerRef.current) {
         void ocrWorkerRef.current.terminate();
         ocrWorkerRef.current = null;
       }
+      if (audioContextRef.current) {
+        void audioContextRef.current.close();
+        audioContextRef.current = null;
+      }
       ocrWorkerInitRef.current = null;
     };
   }, []);
 
-  const stopScanning = () => {
-    if (scanTimerRef.current) {
-      window.clearInterval(scanTimerRef.current);
-      scanTimerRef.current = null;
-    }
-    setIsRunning(false);
-    setStatus("Escaneo pausado.");
-  };
+  const playDetectionFeedback = () => {
+    setIsFeedbackOn(true);
+    if (feedbackTimerRef.current) window.clearTimeout(feedbackTimerRef.current);
+    feedbackTimerRef.current = window.setTimeout(() => {
+      setIsFeedbackOn(false);
+    }, 320);
 
-  const stopCamera = () => {
-    stopScanning();
-    streamRef.current?.getTracks().forEach((track) => track.stop());
-    streamRef.current = null;
-    if (videoRef.current) {
-      videoRef.current.pause();
-      videoRef.current.srcObject = null;
+    if ("vibrate" in navigator) navigator.vibrate?.(90);
+
+    try {
+      const AudioCtx = window.AudioContext || (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+      if (!AudioCtx) return;
+      if (!audioContextRef.current) audioContextRef.current = new AudioCtx();
+
+      const ctx = audioContextRef.current;
+      if (ctx.state === "suspended") void ctx.resume();
+
+      const oscillator = ctx.createOscillator();
+      const gain = ctx.createGain();
+      oscillator.type = "sine";
+      oscillator.frequency.setValueAtTime(1046, ctx.currentTime);
+      gain.gain.setValueAtTime(0.001, ctx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.18, ctx.currentTime + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.18);
+      oscillator.connect(gain);
+      gain.connect(ctx.destination);
+      oscillator.start();
+      oscillator.stop(ctx.currentTime + 0.2);
+    } catch {
+      // Ignore audio errors on browsers that require explicit user gesture.
     }
-    setCameraReady(false);
-    setOcrConfidence(null);
-    setStatus("Cámara detenida.");
   };
 
   const addScan = (match: { id: string; label: string }, rawText: string, source: "camera" | "image") => {
@@ -347,6 +377,7 @@ export default function TropicanaCardScannerWeb() {
     lastAcceptedRef.current = { id: match.id, at: now };
     setCurrentMatch(match.label);
     setStatus(`Tarjeta detectada: ${match.label}`);
+    playDetectionFeedback();
 
     setHistory((prev) => [
       {
@@ -508,9 +539,22 @@ export default function TropicanaCardScannerWeb() {
       setCameraReady(false);
       setPermissionState(await getCameraPermissionState());
       setLastError(message);
-      setStatus(`${message} Usa HTTPS/localhost o el botón de subir imagen como plan B.`);
+      setStatus(`${message} Si no abre, usa HTTPS/localhost o sube una imagen como plan B.`);
     }
   };
+
+  useEffect(() => {
+    if (autoBootRef.current) return;
+    if (!cameraSupported || !secureContext) return;
+    autoBootRef.current = true;
+    void startCamera();
+  }, [cameraSupported, secureContext]);
+
+  useEffect(() => {
+    if (cameraReady && !isRunning) {
+      startScanning();
+    }
+  }, [cameraReady, isRunning, intervalMs]);
 
   const clearHistory = () => {
     setHistory([]);
@@ -588,17 +632,13 @@ export default function TropicanaCardScannerWeb() {
                   Escáner de tarjetas · Tropicana Cherry
                 </CardTitle>
                 <p className="mt-2 text-sm text-slate-600">
-                  Muestra una tarjeta a cámara y la app leerá el texto para detectar si es pack de 3, 5, 10, 25 o 100. Si la cámara falla, puedes subir una foto como alternativa.
+                  La detección es automática: solo valida tarjetas que contengan "Tropicana Cherry" y lee el número del campo "Nº semis" para identificar pack 3, 5, 10, 25 o 100.
                 </p>
               </div>
               <div className="flex flex-wrap gap-2">
-                <Button onClick={startCamera} disabled={cameraReady} className="rounded-2xl">
+                <Button onClick={() => void startCamera()} disabled={cameraReady} variant="outline" className="rounded-2xl">
                   <Play className="mr-2 h-4 w-4" />
-                  Iniciar cámara
-                </Button>
-                <Button onClick={stopCamera} variant="outline" className="rounded-2xl">
-                  <Square className="mr-2 h-4 w-4" />
-                  Detener cámara
+                  Reintentar cámara
                 </Button>
                 <Button variant="outline" className="rounded-2xl" onClick={() => fileInputRef.current?.click()} disabled={isProcessingImage}>
                   <Upload className="mr-2 h-4 w-4" />
@@ -617,10 +657,20 @@ export default function TropicanaCardScannerWeb() {
                     <video ref={videoRef} className="aspect-video w-full object-cover" autoPlay muted playsInline />
 
                     <div className="pointer-events-none absolute inset-0 flex items-center justify-center p-6">
-                      <div className="relative w-full max-w-md rounded-[2rem] border-4 border-emerald-400/80 shadow-[0_0_0_9999px_rgba(0,0,0,0.28)]">
+                      <div
+                        className={`relative w-full max-w-md rounded-[2rem] border-4 shadow-[0_0_0_9999px_rgba(0,0,0,0.28)] transition-all duration-200 ${
+                          isFeedbackOn ? "scale-105 border-lime-300 bg-lime-200/10" : "border-emerald-400/80"
+                        }`}
+                      >
                         <div className="absolute left-0 right-0 top-1/2 h-0.5 -translate-y-1/2 bg-emerald-300/90" />
                       </div>
                     </div>
+
+                    {isFeedbackOn ? (
+                      <div className="absolute right-3 top-3 rounded-xl bg-lime-400 px-3 py-1.5 text-xs font-bold text-slate-900">
+                        DETECTADO
+                      </div>
+                    ) : null}
 
                     <div className="absolute bottom-3 left-3 right-3 rounded-2xl bg-black/55 px-4 py-3 text-sm text-white backdrop-blur-sm">
                       <div className="flex items-center gap-2 font-medium">
@@ -696,21 +746,13 @@ export default function TropicanaCardScannerWeb() {
               <Card className="rounded-3xl border-slate-200 shadow-sm md:col-span-2">
                 <CardContent className="p-4">
                   <div className="mb-3 flex items-center justify-between">
-                    <div className="text-sm font-semibold text-slate-700">Controles de escaneo</div>
+                    <div className="text-sm font-semibold text-slate-700">Escaneo automático</div>
                     <Badge variant="secondary" className="rounded-xl px-3 py-1">
-                      {isRunning ? "Activo" : "Pausado"}
+                      {isRunning ? "Auto activo" : "Esperando cámara"}
                     </Badge>
                   </div>
 
                   <div className="flex flex-wrap gap-2">
-                    <Button onClick={startScanning} disabled={!cameraReady || isRunning} className="rounded-2xl">
-                      <Play className="mr-2 h-4 w-4" />
-                      Empezar a escanear
-                    </Button>
-                    <Button onClick={stopScanning} variant="outline" disabled={!isRunning} className="rounded-2xl">
-                      <Square className="mr-2 h-4 w-4" />
-                      Pausar
-                    </Button>
                     <Button onClick={clearHistory} variant="outline" className="rounded-2xl">
                       <Trash2 className="mr-2 h-4 w-4" />
                       Limpiar lista
@@ -721,16 +763,8 @@ export default function TropicanaCardScannerWeb() {
                     </Button>
                   </div>
 
-                  <div className="mt-4 flex items-center gap-3">
-                    <label className="text-sm text-slate-600">Intervalo de lectura (ms)</label>
-                    <Input
-                      type="number"
-                      min={700}
-                      step={100}
-                      value={intervalMs}
-                      onChange={(e) => setIntervalMs(Number(e.target.value || 1200))}
-                      className="max-w-32 rounded-2xl"
-                    />
+                  <div className="mt-4 rounded-2xl bg-emerald-50 px-4 py-3 text-sm text-emerald-900">
+                    No tienes que pulsar nada: en cuanto la cámara está activa, la app escanea sola y lanza aviso visual/sonoro cuando detecta una tarjeta.
                   </div>
                 </CardContent>
               </Card>
