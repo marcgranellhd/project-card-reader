@@ -1,6 +1,6 @@
 ﻿# Project Card Reader
 
-App web para escanear tarjetas usando camara + OCR (Tesseract.js).
+App web para escanear tarjetas Tropicana usando comparacion visual por plantillas (sin OCR).
 
 ## Requisitos
 
@@ -15,6 +15,17 @@ npm run dev
 ```
 
 Abrir `http://localhost:5173` o desde otro equipo en la misma red: `http://TU_IP_LOCAL:5173`.
+
+## Entrenamiento de plantillas
+
+1. Abre la pestaña `Entrenamiento` en la app.
+2. Selecciona el tipo de pack (3, 5, 10, 25).
+3. Añade muestras:
+- `Hacer foto de entrenamiento` (usa la camara en directo).
+- `Subir foto de entrenamiento` (desde galeria/archivo).
+4. Repite con varias condiciones de luz/angulo.
+
+Las muestras se guardan en `localStorage` del navegador y se cargan automaticamente para mejorar precision y reducir falsas detecciones.
 
 ## Ejecutar con Docker Compose (simple)
 

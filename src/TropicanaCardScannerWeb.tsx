@@ -45,9 +45,13 @@ type TemplateHashes = {
   title: Uint8Array;
   semis: Uint8Array;
   body: Uint8Array;
+  numberHash: Uint8Array;
+  numberPatch: Float32Array;
 };
 
 type LoadedTemplate = CardPattern & {
+  templateId: string;
+  source: "base" | "training";
   hashes: TemplateHashes;
 };
 
@@ -57,6 +61,19 @@ type DetectionResult = {
   titleScore: number;
   semisScore: number;
   bodyScore: number;
+  numberScore: number;
+  numberHashScore: number;
+  numberPatchScore: number;
+  scoreGap: number;
+  numberGap: number;
+  semisGap: number;
+};
+
+type TrainingSample = {
+  id: string;
+  cardId: string;
+  dataUrl: string;
+  createdAt: number;
 };
 
 const CARD_PATTERNS: CardPattern[] = [
@@ -66,36 +83,81 @@ const CARD_PATTERNS: CardPattern[] = [
   { id: "tropicana-cherry-25", label: "Tropicana Cherry - Pack de 25", pack: 25, src: "/templates/pack25.jpg" },
 ];
 
+const TRAINING_STORAGE_KEY = "tropicana-training-samples-v1";
+const MAX_TRAINING_SAMPLES = 140;
+
 const CARD_SIZE = { width: 768, height: 1024 };
 const HASH_SIZE = { width: 17, height: 16 };
+const NUMBER_PATCH_SIZE = { width: 56, height: 34 };
 
 const TITLE_ROI: Roi = { x: 0.05, y: 0.02, w: 0.58, h: 0.22 };
-const SEMIS_ROI: Roi = { x: 0.03, y: 0.66, w: 0.3, h: 0.24 };
+const SEMIS_ROI: Roi = { x: 0.02, y: 0.64, w: 0.26, h: 0.24 };
 const BODY_ROI: Roi = { x: 0.05, y: 0.28, w: 0.62, h: 0.28 };
+const NUMBER_ROI: Roi = { x: 0.035, y: 0.74, w: 0.18, h: 0.12 };
 
-const MIN_TITLE_SCORE = 0.43;
+const MIN_TITLE_SCORE = 0.42;
 const MIN_SEMIS_SCORE = 0.4;
-const MIN_BODY_SCORE = 0.38;
-const MIN_TOTAL_SCORE = 0.46;
+const MIN_BODY_SCORE = 0.36;
+const MIN_NUMBER_SCORE = 0.49;
+const MIN_TOTAL_SCORE = 0.5;
 
-const ROI_JITTERS: Array<{ dx: number; dy: number; scale: number }> = [
+const GENERAL_ROI_JITTERS: Array<{ dx: number; dy: number; scale: number }> = [
   { dx: 0, dy: 0, scale: 1 },
-  { dx: -0.06, dy: 0, scale: 1 },
-  { dx: 0.06, dy: 0, scale: 1 },
-  { dx: 0, dy: -0.06, scale: 1 },
-  { dx: 0, dy: 0.06, scale: 1 },
-  { dx: -0.04, dy: -0.04, scale: 1 },
-  { dx: 0.04, dy: 0.04, scale: 1 },
-  { dx: 0, dy: 0, scale: 0.9 },
-  { dx: 0, dy: 0, scale: 1.1 },
+  { dx: -0.05, dy: 0, scale: 1 },
+  { dx: 0.05, dy: 0, scale: 1 },
+  { dx: 0, dy: -0.05, scale: 1 },
+  { dx: 0, dy: 0.05, scale: 1 },
+  { dx: 0, dy: 0, scale: 0.95 },
+  { dx: 0, dy: 0, scale: 1.05 },
 ];
 
-const CONFIRM_WINDOW_MS = 2200;
+const NUMBER_ROI_JITTERS: Array<{ dx: number; dy: number; scale: number }> = [
+  { dx: 0, dy: 0, scale: 1 },
+  { dx: -0.03, dy: 0, scale: 1 },
+  { dx: 0.03, dy: 0, scale: 1 },
+  { dx: 0, dy: -0.03, scale: 1 },
+  { dx: 0, dy: 0.03, scale: 1 },
+  { dx: 0, dy: 0, scale: 0.95 },
+  { dx: 0, dy: 0, scale: 1.05 },
+];
+
+const MIN_SCORE_GAP = 0.03;
+const MIN_NUMBER_GAP = 0.045;
+const MIN_SEMIS_GAP = 0.025;
+
+const FAST_CONFIRM_SCORE = 0.66;
+const FAST_CONFIRM_NUMBER = 0.66;
+
+const CONFIRM_WINDOW_MS = 2600;
 const DEDUPE_COOLDOWN_MS = 1800;
-const SCAN_INTERVAL_MS = 420;
+const SCAN_INTERVAL_MS = 320;
 
 function formatTime() {
   return new Date().toLocaleTimeString();
+}
+
+function makeId() {
+  if ("randomUUID" in crypto) return crypto.randomUUID();
+  return `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function readTrainingSamples() {
+  try {
+    const raw = localStorage.getItem(TRAINING_STORAGE_KEY);
+    if (!raw) return [] as TrainingSample[];
+    const parsed = JSON.parse(raw) as TrainingSample[];
+    if (!Array.isArray(parsed)) return [] as TrainingSample[];
+    return parsed.filter((item) => {
+      return (
+        typeof item?.id === "string" &&
+        typeof item?.cardId === "string" &&
+        typeof item?.dataUrl === "string" &&
+        typeof item?.createdAt === "number"
+      );
+    });
+  } catch {
+    return [] as TrainingSample[];
+  }
 }
 
 function drawCover(source: CanvasImageSource, srcW: number, srcH: number, ctx: CanvasRenderingContext2D, dstW: number, dstH: number) {
@@ -151,11 +213,72 @@ function hashSimilarity(a: Uint8Array, b: Uint8Array) {
   return same / a.length;
 }
 
+function extractNormalizedPatch(
+  cardCanvas: HTMLCanvasElement,
+  roi: Roi,
+  scratchCanvas: HTMLCanvasElement,
+  patchW: number,
+  patchH: number,
+) {
+  scratchCanvas.width = patchW;
+  scratchCanvas.height = patchH;
+  const ctx = scratchCanvas.getContext("2d");
+  if (!ctx) return new Float32Array(patchW * patchH);
+
+  const sx = Math.round(cardCanvas.width * roi.x);
+  const sy = Math.round(cardCanvas.height * roi.y);
+  const sw = Math.max(1, Math.round(cardCanvas.width * roi.w));
+  const sh = Math.max(1, Math.round(cardCanvas.height * roi.h));
+
+  ctx.clearRect(0, 0, patchW, patchH);
+  ctx.drawImage(cardCanvas, sx, sy, sw, sh, 0, 0, patchW, patchH);
+
+  const image = ctx.getImageData(0, 0, patchW, patchH);
+  const data = image.data;
+  const patch = new Float32Array(patchW * patchH);
+
+  let mean = 0;
+  for (let i = 0, p = 0; i < data.length; i += 4, p += 1) {
+    const gray = (data[i] * 299 + data[i + 1] * 587 + data[i + 2] * 114) / 1000;
+    patch[p] = gray;
+    mean += gray;
+  }
+  mean /= patch.length || 1;
+
+  let variance = 0;
+  for (let i = 0; i < patch.length; i += 1) {
+    const centered = patch[i] - mean;
+    patch[i] = centered;
+    variance += centered * centered;
+  }
+  const std = Math.sqrt(variance / (patch.length || 1)) || 1;
+
+  for (let i = 0; i < patch.length; i += 1) patch[i] /= std;
+  return patch;
+}
+
+function patchCosineSimilarity(a: Float32Array, b: Float32Array) {
+  if (a.length !== b.length || a.length === 0) return 0;
+  let dot = 0;
+  let normA = 0;
+  let normB = 0;
+  for (let i = 0; i < a.length; i += 1) {
+    dot += a[i] * b[i];
+    normA += a[i] * a[i];
+    normB += b[i] * b[i];
+  }
+  if (normA <= 0 || normB <= 0) return 0;
+  const cosine = dot / Math.sqrt(normA * normB);
+  return clamp((cosine + 1) / 2, 0, 1);
+}
+
 function computeHashes(cardCanvas: HTMLCanvasElement, scratchCanvas: HTMLCanvasElement): TemplateHashes {
   return {
     title: extractDHash(cardCanvas, TITLE_ROI, scratchCanvas),
     semis: extractDHash(cardCanvas, SEMIS_ROI, scratchCanvas),
     body: extractDHash(cardCanvas, BODY_ROI, scratchCanvas),
+    numberHash: extractDHash(cardCanvas, NUMBER_ROI, scratchCanvas),
+    numberPatch: extractNormalizedPatch(cardCanvas, NUMBER_ROI, scratchCanvas, NUMBER_PATCH_SIZE.width, NUMBER_PATCH_SIZE.height),
   };
 }
 
@@ -171,9 +294,15 @@ function jitterRoi(base: Roi, dx: number, dy: number, scale: number): Roi {
   return { x, y, w, h };
 }
 
-function bestRoiSimilarity(cardCanvas: HTMLCanvasElement, baseRoi: Roi, templateHash: Uint8Array, scratchCanvas: HTMLCanvasElement) {
+function bestRoiSimilarity(
+  cardCanvas: HTMLCanvasElement,
+  baseRoi: Roi,
+  templateHash: Uint8Array,
+  scratchCanvas: HTMLCanvasElement,
+  jitters: Array<{ dx: number; dy: number; scale: number }>,
+) {
   let best = 0;
-  for (const jitter of ROI_JITTERS) {
+  for (const jitter of jitters) {
     const roi = jitterRoi(baseRoi, jitter.dx, jitter.dy, jitter.scale);
     const currentHash = extractDHash(cardCanvas, roi, scratchCanvas);
     const score = hashSimilarity(currentHash, templateHash);
@@ -182,31 +311,88 @@ function bestRoiSimilarity(cardCanvas: HTMLCanvasElement, baseRoi: Roi, template
   return best;
 }
 
+function bestRoiPatchSimilarity(
+  cardCanvas: HTMLCanvasElement,
+  baseRoi: Roi,
+  templatePatch: Float32Array,
+  scratchCanvas: HTMLCanvasElement,
+  jitters: Array<{ dx: number; dy: number; scale: number }>,
+) {
+  let best = 0;
+  for (const jitter of jitters) {
+    const roi = jitterRoi(baseRoi, jitter.dx, jitter.dy, jitter.scale);
+    const currentPatch = extractNormalizedPatch(cardCanvas, roi, scratchCanvas, NUMBER_PATCH_SIZE.width, NUMBER_PATCH_SIZE.height);
+    const score = patchCosineSimilarity(currentPatch, templatePatch);
+    if (score > best) best = score;
+  }
+  return best;
+}
+
 function evaluateDetection(cardCanvas: HTMLCanvasElement, scratchCanvas: HTMLCanvasElement, templates: LoadedTemplate[]): DetectionResult | null {
-  const candidates: DetectionResult[] = [];
+  const templateCandidates: DetectionResult[] = [];
 
   for (const template of templates) {
-    const titleScore = bestRoiSimilarity(cardCanvas, TITLE_ROI, template.hashes.title, scratchCanvas);
-    const semisScore = bestRoiSimilarity(cardCanvas, SEMIS_ROI, template.hashes.semis, scratchCanvas);
-    const bodyScore = bestRoiSimilarity(cardCanvas, BODY_ROI, template.hashes.body, scratchCanvas);
-    const score = titleScore * 0.25 + semisScore * 0.55 + bodyScore * 0.2;
+    const titleScore = bestRoiSimilarity(cardCanvas, TITLE_ROI, template.hashes.title, scratchCanvas, GENERAL_ROI_JITTERS);
+    const semisScore = bestRoiSimilarity(cardCanvas, SEMIS_ROI, template.hashes.semis, scratchCanvas, GENERAL_ROI_JITTERS);
+    const bodyScore = bestRoiSimilarity(cardCanvas, BODY_ROI, template.hashes.body, scratchCanvas, GENERAL_ROI_JITTERS);
+    const numberHashScore = bestRoiSimilarity(cardCanvas, NUMBER_ROI, template.hashes.numberHash, scratchCanvas, NUMBER_ROI_JITTERS);
+    const numberPatchScore = bestRoiPatchSimilarity(cardCanvas, NUMBER_ROI, template.hashes.numberPatch, scratchCanvas, NUMBER_ROI_JITTERS);
+    const numberScore = numberHashScore * 0.42 + numberPatchScore * 0.58;
+    const score = titleScore * 0.16 + semisScore * 0.24 + bodyScore * 0.14 + numberScore * 0.46;
 
     const valid =
       titleScore >= MIN_TITLE_SCORE &&
       semisScore >= MIN_SEMIS_SCORE &&
       bodyScore >= MIN_BODY_SCORE &&
+      numberScore >= MIN_NUMBER_SCORE &&
       score >= MIN_TOTAL_SCORE;
 
     if (!valid) continue;
-    candidates.push({ match: template, score, titleScore, semisScore, bodyScore });
+    templateCandidates.push({
+      match: template,
+      score,
+      titleScore,
+      semisScore,
+      bodyScore,
+      numberScore,
+      numberHashScore,
+      numberPatchScore,
+      scoreGap: 1,
+      numberGap: 1,
+      semisGap: 1,
+    });
   }
 
-  if (candidates.length === 0) return null;
+  if (templateCandidates.length === 0) return null;
+
+  // Keep the best template per card type (pack 3/5/10/25), so multiple training
+  // samples of the same card strengthen detection instead of competing.
+  const bestByCard = new Map<string, DetectionResult>();
+  for (const candidate of templateCandidates) {
+    const prev = bestByCard.get(candidate.match.id);
+    if (!prev || candidate.score > prev.score) bestByCard.set(candidate.match.id, candidate);
+  }
+
+  const candidates = Array.from(bestByCard.values());
   candidates.sort((a, b) => b.score - a.score);
   const best = candidates[0];
   const second = candidates[1];
 
-  if (second && best.score - second.score < 0.015 && Math.abs(best.semisScore - second.semisScore) < 0.02) {
+  if (second) {
+    const scoreGap = best.score - second.score;
+    const numberGap = best.numberScore - second.numberScore;
+    const semisGap = best.semisScore - second.semisScore;
+
+    if (scoreGap < MIN_SCORE_GAP || numberGap < MIN_NUMBER_GAP || semisGap < MIN_SEMIS_GAP) {
+      return null;
+    }
+
+    best.scoreGap = scoreGap;
+    best.numberGap = numberGap;
+    best.semisGap = semisGap;
+  }
+
+  if (best.numberScore < MIN_NUMBER_SCORE) {
     return null;
   }
 
@@ -241,16 +427,20 @@ export default function TropicanaCardScannerWeb() {
   const cardCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const scratchCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const trainingFileInputRef = useRef<HTMLInputElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const scanTimerRef = useRef<number | null>(null);
   const feedbackTimerRef = useRef<number | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const isBusyRef = useRef(false);
   const lastAcceptedRef = useRef<{ id: string; at: number } | null>(null);
-  const pendingRef = useRef<{ id: string; count: number; at: number } | null>(null);
+  const pendingRef = useRef<{ id: string; count: number; at: number; required: number } | null>(null);
 
   const [templates, setTemplates] = useState<LoadedTemplate[]>([]);
   const [templatesReady, setTemplatesReady] = useState(false);
+  const [viewMode, setViewMode] = useState<"scanner" | "training">("scanner");
+  const [trainingSamples, setTrainingSamples] = useState<TrainingSample[]>(() => readTrainingSamples());
+  const [selectedTrainingCardId, setSelectedTrainingCardId] = useState(CARD_PATTERNS[0]?.id ?? "");
 
   const [cameraReady, setCameraReady] = useState(false);
   const [isRunning, setIsRunning] = useState(false);
@@ -269,6 +459,7 @@ export default function TropicanaCardScannerWeb() {
   const [debugTitle, setDebugTitle] = useState(0);
   const [debugSemis, setDebugSemis] = useState(0);
   const [debugBody, setDebugBody] = useState(0);
+  const [debugNumber, setDebugNumber] = useState(0);
 
   const totals = useMemo(() => {
     return history.reduce<Record<string, number>>((acc, item) => {
@@ -276,6 +467,25 @@ export default function TropicanaCardScannerWeb() {
       return acc;
     }, {});
   }, [history]);
+
+  const trainingTotals = useMemo(() => {
+    return trainingSamples.reduce<Record<string, number>>((acc, item) => {
+      acc[item.cardId] = (acc[item.cardId] || 0) + 1;
+      return acc;
+    }, {});
+  }, [trainingSamples]);
+
+  const trainingSamplesSorted = useMemo(() => {
+    return [...trainingSamples].sort((a, b) => b.createdAt - a.createdAt);
+  }, [trainingSamples]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(TRAINING_STORAGE_KEY, JSON.stringify(trainingSamples));
+    } catch {
+      // Ignore storage errors.
+    }
+  }, [trainingSamples]);
 
   useEffect(() => {
     setSecureContext(window.isSecureContext || window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1");
@@ -313,16 +523,56 @@ export default function TropicanaCardScannerWeb() {
           if (!ctx) continue;
 
           drawCover(img, img.naturalWidth, img.naturalHeight, ctx, cardCanvas.width, cardCanvas.height);
-          loaded.push({ ...card, hashes: computeHashes(cardCanvas, scratch) });
+          loaded.push({
+            ...card,
+            templateId: `base-${card.id}`,
+            source: "base",
+            hashes: computeHashes(cardCanvas, scratch),
+          });
         } catch {
           // Skip missing templates.
         }
       }
 
+      for (const sample of trainingSamples) {
+        const baseCard = CARD_PATTERNS.find((card) => card.id === sample.cardId);
+        if (!baseCard) continue;
+
+        try {
+          const img = new Image();
+          img.src = sample.dataUrl;
+          await new Promise<void>((resolve, reject) => {
+            img.onload = () => resolve();
+            img.onerror = () => reject(new Error("training_template_load_error"));
+          });
+
+          const cardCanvas = document.createElement("canvas");
+          cardCanvas.width = CARD_SIZE.width;
+          cardCanvas.height = CARD_SIZE.height;
+          const ctx = cardCanvas.getContext("2d");
+          if (!ctx) continue;
+
+          drawCover(img, img.naturalWidth, img.naturalHeight, ctx, cardCanvas.width, cardCanvas.height);
+          loaded.push({
+            ...baseCard,
+            templateId: `training-${sample.id}`,
+            source: "training",
+            hashes: computeHashes(cardCanvas, scratch),
+          });
+        } catch {
+          // Skip invalid training sample.
+        }
+      }
+
       if (cancelled) return;
       setTemplates(loaded);
+      const cardVarieties = new Set(loaded.map((template) => template.id)).size;
       setTemplatesReady(loaded.length >= 2);
-      setStatus(loaded.length >= 2 ? `Plantillas cargadas: ${loaded.length}.` : "No hay suficientes plantillas cargadas.");
+      setStatus(
+        loaded.length >= 2
+          ? `Plantillas cargadas: ${loaded.length} (${cardVarieties} tipos, ${trainingSamples.length} entrenadas).`
+          : "No hay suficientes plantillas cargadas.",
+      );
     };
 
     void loadTemplates();
@@ -330,7 +580,16 @@ export default function TropicanaCardScannerWeb() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [trainingSamples]);
+
+  const getRequiredConfirmations = (detection: DetectionResult) => {
+    const fastTrack =
+      detection.score >= FAST_CONFIRM_SCORE &&
+      detection.numberScore >= FAST_CONFIRM_NUMBER &&
+      detection.scoreGap >= MIN_SCORE_GAP * 1.8 &&
+      detection.numberGap >= MIN_NUMBER_GAP * 1.8;
+    return fastTrack ? 2 : 3;
+  };
 
   const playFeedback = () => {
     setIsFeedbackOn(true);
@@ -397,6 +656,7 @@ export default function TropicanaCardScannerWeb() {
       setDebugTitle(0);
       setDebugSemis(0);
       setDebugBody(0);
+      setDebugNumber(0);
       return;
     }
 
@@ -405,27 +665,30 @@ export default function TropicanaCardScannerWeb() {
     setDebugTitle(Math.round(detection.titleScore * 100));
     setDebugSemis(Math.round(detection.semisScore * 100));
     setDebugBody(Math.round(detection.bodyScore * 100));
+    setDebugNumber(Math.round(detection.numberScore * 100));
 
     if (source === "image") {
       acceptDetection(detection, source);
       return;
     }
 
+    const required = getRequiredConfirmations(detection);
     const pending = pendingRef.current;
     const now = Date.now();
     if (pending && pending.id === detection.match.id && now - pending.at <= CONFIRM_WINDOW_MS) {
       const nextCount = pending.count + 1;
-      pendingRef.current = { id: pending.id, count: nextCount, at: now };
-      if (nextCount >= 2) {
+      const requiredCount = Math.max(pending.required, required);
+      pendingRef.current = { id: pending.id, count: nextCount, at: now, required: requiredCount };
+      if (nextCount >= requiredCount) {
         acceptDetection(detection, source);
       } else {
-        setStatus(`Posible ${detection.match.label}. Confirmando...`);
+        setStatus(`Posible ${detection.match.label}. Confirmando ${nextCount}/${requiredCount}...`);
       }
       return;
     }
 
-    pendingRef.current = { id: detection.match.id, count: 1, at: now };
-    setStatus(`Posible ${detection.match.label}. Confirmando...`);
+    pendingRef.current = { id: detection.match.id, count: 1, at: now, required };
+    setStatus(`Posible ${detection.match.label}. Confirmando 1/${required}...`);
   };
 
   const detectFromCardCanvas = (source: "camera" | "image") => {
@@ -436,30 +699,37 @@ export default function TropicanaCardScannerWeb() {
     processCandidate(detection, source);
   };
 
-  const detectFromVideo = async () => {
-    if (!videoRef.current || !cardCanvasRef.current || isBusyRef.current || templates.length === 0) return;
+  const drawCurrentCardFrame = () => {
+    if (!videoRef.current || !cardCanvasRef.current) return false;
     const video = videoRef.current;
     const cardCanvas = cardCanvasRef.current;
-    if (video.videoWidth === 0 || video.videoHeight === 0) return;
+    if (video.videoWidth === 0 || video.videoHeight === 0) return false;
     const ctx = cardCanvas.getContext("2d");
-    if (!ctx) return;
+    if (!ctx) return false;
+
+    cardCanvas.width = CARD_SIZE.width;
+    cardCanvas.height = CARD_SIZE.height;
+
+    let cropW = Math.round(video.videoWidth * 0.78);
+    let cropH = Math.round((cropW * 4) / 3);
+    if (cropH > Math.round(video.videoHeight * 0.92)) {
+      cropH = Math.round(video.videoHeight * 0.92);
+      cropW = Math.round((cropH * 3) / 4);
+    }
+
+    const cropX = Math.max(0, Math.round((video.videoWidth - cropW) / 2));
+    const cropY = Math.max(0, Math.round((video.videoHeight - cropH) / 2));
+
+    ctx.drawImage(video, cropX, cropY, cropW, cropH, 0, 0, cardCanvas.width, cardCanvas.height);
+    return true;
+  };
+
+  const detectFromVideo = async () => {
+    if (!videoRef.current || !cardCanvasRef.current || isBusyRef.current || templates.length === 0) return;
 
     isBusyRef.current = true;
     try {
-      cardCanvas.width = CARD_SIZE.width;
-      cardCanvas.height = CARD_SIZE.height;
-
-      let cropW = Math.round(video.videoWidth * 0.78);
-      let cropH = Math.round((cropW * 4) / 3);
-      if (cropH > Math.round(video.videoHeight * 0.92)) {
-        cropH = Math.round(video.videoHeight * 0.92);
-        cropW = Math.round((cropH * 3) / 4);
-      }
-
-      const cropX = Math.max(0, Math.round((video.videoWidth - cropW) / 2));
-      const cropY = Math.max(0, Math.round((video.videoHeight - cropH) / 2));
-
-      ctx.drawImage(video, cropX, cropY, cropW, cropH, 0, 0, cardCanvas.width, cardCanvas.height);
+      if (!drawCurrentCardFrame()) return;
       detectFromCardCanvas("camera");
     } finally {
       isBusyRef.current = false;
@@ -467,7 +737,7 @@ export default function TropicanaCardScannerWeb() {
   };
 
   const startScanning = () => {
-    if (!cameraReady || !templatesReady) return;
+    if (viewMode !== "scanner" || !cameraReady || !templatesReady) return;
     if (scanTimerRef.current) window.clearInterval(scanTimerRef.current);
     setIsRunning(true);
     setStatus("Escaneo visual rapido activo.");
@@ -528,8 +798,23 @@ export default function TropicanaCardScannerWeb() {
   }, [templatesReady, cameraSupported, secureContext, cameraReady]);
 
   useEffect(() => {
+    if (!videoRef.current || !streamRef.current) return;
+    videoRef.current.srcObject = streamRef.current;
+    void videoRef.current.play().catch(() => undefined);
+  }, [viewMode, cameraReady]);
+
+  useEffect(() => {
+    if (viewMode === "training") {
+      if (scanTimerRef.current) {
+        window.clearInterval(scanTimerRef.current);
+        scanTimerRef.current = null;
+      }
+      if (isRunning) setIsRunning(false);
+      return;
+    }
+
     if (cameraReady && templatesReady && !isRunning) startScanning();
-  }, [cameraReady, templatesReady, isRunning]);
+  }, [cameraReady, templatesReady, isRunning, viewMode]);
 
   const clearHistory = () => {
     setHistory([]);
@@ -581,167 +866,376 @@ export default function TropicanaCardScannerWeb() {
     }
   };
 
+  const addTrainingSample = (cardId: string, dataUrl: string) => {
+    const card = CARD_PATTERNS.find((item) => item.id === cardId);
+    setTrainingSamples((prev) => [{ id: makeId(), cardId, dataUrl, createdAt: Date.now() }, ...prev].slice(0, MAX_TRAINING_SAMPLES));
+    setStatus(`Muestra guardada para ${card?.label ?? cardId}.`);
+  };
+
+  const captureTrainingFromCamera = () => {
+    if (!selectedTrainingCardId) {
+      setStatus("Selecciona el tipo de pack antes de entrenar.");
+      return;
+    }
+    if (!cameraReady) {
+      setStatus("Activa la camara primero para capturar muestras.");
+      return;
+    }
+    if (!cardCanvasRef.current) {
+      setStatus("No se pudo preparar el area de captura.");
+      return;
+    }
+    const ok = drawCurrentCardFrame();
+    if (!ok) {
+      setStatus("No hay frame de camara disponible.");
+      return;
+    }
+    const dataUrl = cardCanvasRef.current.toDataURL("image/jpeg", 0.92);
+    addTrainingSample(selectedTrainingCardId, dataUrl);
+  };
+
+  const handleTrainingUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file || !cardCanvasRef.current) return;
+    if (!selectedTrainingCardId) {
+      setStatus("Selecciona el tipo de pack antes de subir muestras.");
+      event.target.value = "";
+      return;
+    }
+
+    setIsProcessingImage(true);
+    setStatus("Procesando muestra para entrenamiento...");
+    try {
+      const imageUrl = URL.createObjectURL(file);
+      const image = new Image();
+      image.src = imageUrl;
+      await new Promise<void>((resolve, reject) => {
+        image.onload = () => resolve();
+        image.onerror = () => reject(new Error("image_load_error"));
+      });
+
+      const cardCanvas = cardCanvasRef.current;
+      cardCanvas.width = CARD_SIZE.width;
+      cardCanvas.height = CARD_SIZE.height;
+      const ctx = cardCanvas.getContext("2d");
+      if (!ctx) throw new Error("canvas_context_error");
+      drawCover(image, image.naturalWidth, image.naturalHeight, ctx, cardCanvas.width, cardCanvas.height);
+
+      const dataUrl = cardCanvas.toDataURL("image/jpeg", 0.92);
+      addTrainingSample(selectedTrainingCardId, dataUrl);
+      URL.revokeObjectURL(imageUrl);
+    } catch {
+      setStatus("No se pudo procesar la muestra de entrenamiento.");
+    } finally {
+      setIsProcessingImage(false);
+      event.target.value = "";
+    }
+  };
+
+  const deleteTrainingSample = (sampleId: string) => {
+    setTrainingSamples((prev) => prev.filter((sample) => sample.id !== sampleId));
+    setStatus("Muestra eliminada.");
+  };
+
+  const clearTrainingByCard = (cardId: string) => {
+    setTrainingSamples((prev) => prev.filter((sample) => sample.cardId !== cardId));
+    const card = CARD_PATTERNS.find((item) => item.id === cardId);
+    setStatus(`Entrenamiento borrado para ${card?.label ?? cardId}.`);
+  };
+
+  const clearAllTraining = () => {
+    setTrainingSamples([]);
+    setStatus("Todas las muestras de entrenamiento fueron eliminadas.");
+  };
+
   const totalScans = history.length;
 
   return (
     <div className="min-h-screen bg-slate-50 p-4 md:p-8">
-      <div className="mx-auto grid max-w-7xl gap-6 lg:grid-cols-[1.35fr_0.95fr]">
-        <Card className="overflow-hidden rounded-3xl border-0 shadow-xl">
-          <CardHeader className="border-b bg-white">
-            <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
-              <div>
-                <CardTitle className="flex items-center gap-2 text-2xl">
-                  <Camera className="h-6 w-6" />
-                  Escaner visual · Tropicana Cherry
-                </CardTitle>
-                <p className="mt-2 text-sm text-slate-600">Comparacion por plantillas reales, sin OCR. Si no coincide con una foto valida, se descarta.</p>
-              </div>
-              <div className="flex flex-wrap gap-2">
-                <Button onClick={() => void startCamera()} disabled={!templatesReady || cameraReady} variant="outline" className="rounded-2xl">
-                  <Play className="mr-2 h-4 w-4" />
-                  Reintentar camara
-                </Button>
-                <Button variant="outline" className="rounded-2xl" onClick={() => fileInputRef.current?.click()} disabled={isProcessingImage || !templatesReady}>
-                  <Upload className="mr-2 h-4 w-4" />
-                  Subir imagen
-                </Button>
-                <input ref={fileInputRef} type="file" accept="image/*" className="hidden" onChange={handleImageUpload} />
-              </div>
-            </div>
-          </CardHeader>
+      <div className="mx-auto mb-6 flex max-w-7xl flex-wrap gap-2">
+        <Button className="rounded-2xl" variant={viewMode === "scanner" ? "default" : "outline"} onClick={() => setViewMode("scanner")}>Escaner</Button>
+        <Button className="rounded-2xl" variant={viewMode === "training" ? "default" : "outline"} onClick={() => setViewMode("training")}>Entrenamiento</Button>
+      </div>
 
-          <CardContent className="space-y-4 p-4 md:p-6">
-            <div className="grid gap-4 md:grid-cols-3">
-              <Card className="rounded-3xl border-slate-200 shadow-sm md:col-span-2">
-                <CardContent className="p-4">
-                  <div className="relative overflow-hidden rounded-3xl bg-slate-900">
-                    <video ref={videoRef} className="aspect-video w-full object-cover" autoPlay muted playsInline />
-                    <div className="pointer-events-none absolute inset-0 flex items-center justify-center p-6">
-                      <div className={`relative w-full max-w-md rounded-[2rem] border-4 shadow-[0_0_0_9999px_rgba(0,0,0,0.28)] transition-all duration-150 ${isFeedbackOn ? "scale-105 border-lime-300 bg-lime-200/10" : "border-emerald-400/80"}`}>
-                        <div className="absolute left-0 right-0 top-1/2 h-0.5 -translate-y-1/2 bg-emerald-300/90" />
-                      </div>
-                    </div>
-                    {isFeedbackOn ? <div className="absolute right-3 top-3 rounded-xl bg-lime-400 px-3 py-1.5 text-xs font-bold text-slate-900">DETECTADO</div> : null}
-                    <div className="absolute bottom-3 left-3 right-3 rounded-2xl bg-black/55 px-4 py-3 text-sm text-white backdrop-blur-sm">
-                      <div className="flex items-center gap-2 font-medium">
-                        <ScanLine className="h-4 w-4" />
-                        Estado
-                      </div>
-                      <div className="mt-1 text-white/90">{status}</div>
-                    </div>
-                  </div>
-                </CardContent>
-              </Card>
-
-              <Card className="rounded-3xl border-slate-200 shadow-sm">
-                <CardContent className="space-y-3 p-4">
-                  <div className="text-sm font-semibold text-slate-700">Entorno</div>
-                  <div className="space-y-2 text-sm text-slate-600">
-                    <div className="flex items-center justify-between rounded-2xl bg-slate-50 px-3 py-2"><span>Plantillas</span><Badge variant={templatesReady ? "default" : "destructive"} className="rounded-xl">{templates.length}</Badge></div>
-                    <div className="flex items-center justify-between rounded-2xl bg-slate-50 px-3 py-2"><span>HTTPS / localhost</span><Badge variant={secureContext ? "default" : "destructive"} className="rounded-xl">{secureContext ? "Si" : "No"}</Badge></div>
-                    <div className="flex items-center justify-between rounded-2xl bg-slate-50 px-3 py-2"><span>Permiso camara</span><Badge variant={permissionState === "granted" ? "default" : permissionState === "denied" ? "destructive" : "secondary"} className="rounded-xl">{permissionState}</Badge></div>
-                    <div className="flex items-center justify-between rounded-2xl bg-slate-50 px-3 py-2"><span>Score total</span><Badge variant={debugScore >= 60 ? "default" : "secondary"} className="rounded-xl">{debugScore}%</Badge></div>
-                  </div>
-
-                  {lastError ? (
-                    <div className="rounded-2xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900">
-                      <div className="flex items-start gap-2 font-medium"><ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" />Problema detectado</div>
-                      <div className="mt-2 leading-6">{lastError}</div>
-                    </div>
-                  ) : null}
-
-                  <div>
-                    <div className="text-sm font-semibold text-slate-700">Ultima deteccion</div>
-                    <div className="mt-2 min-h-20 rounded-2xl bg-slate-50 p-3 text-sm">
-                      {currentMatch ? <div className="flex items-start gap-2 text-emerald-700"><CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0" /><span>{currentMatch}</span></div> : <div className="flex items-start gap-2 text-slate-500"><AlertCircle className="mt-0.5 h-4 w-4 shrink-0" /><span>Aun no hay deteccion valida.</span></div>}
-                    </div>
-                  </div>
-
-                  <div><div className="text-sm font-semibold text-slate-700">Total escaneos</div><div className="mt-1 text-3xl font-bold tracking-tight text-slate-900">{totalScans}</div></div>
-                </CardContent>
-              </Card>
-            </div>
-
-            <div className="grid gap-4 md:grid-cols-3">
-              <Card className="rounded-3xl border-slate-200 shadow-sm md:col-span-2">
-                <CardContent className="p-4">
-                  <div className="mb-3 flex items-center justify-between">
-                    <div className="text-sm font-semibold text-slate-700">Escaneo rapido anti-falsos</div>
-                    <Badge variant="secondary" className="rounded-xl px-3 py-1">{isRunning ? "Auto activo" : "Esperando camara"}</Badge>
-                  </div>
-                  <div className="flex flex-wrap gap-2">
-                    <Button onClick={clearHistory} variant="outline" className="rounded-2xl"><Trash2 className="mr-2 h-4 w-4" />Limpiar lista</Button>
-                    <Button onClick={copySummary} variant="outline" className="rounded-2xl"><Copy className="mr-2 h-4 w-4" />Copiar resumen</Button>
-                  </div>
-                  <div className="mt-4 rounded-2xl bg-emerald-50 px-4 py-3 text-sm text-emerald-900">Compara hash visual de titulo + caja \"N semis\" + cuerpo y confirma en 2 lecturas seguidas antes de contar.</div>
-                </CardContent>
-              </Card>
-
-              <Card className="rounded-3xl border-slate-200 shadow-sm">
-                <CardContent className="p-4">
-                  <div className="text-sm font-semibold text-slate-700">Debug detector</div>
-                  <div className="mt-3 space-y-2 text-sm text-slate-700">
-                    <div className="flex items-center justify-between rounded-2xl bg-slate-50 px-3 py-2"><span>Mejor plantilla</span><span className="font-semibold">{debugBest}</span></div>
-                    <div className="flex items-center justify-between rounded-2xl bg-slate-50 px-3 py-2"><span>Titulo</span><span>{debugTitle}%</span></div>
-                    <div className="flex items-center justify-between rounded-2xl bg-slate-50 px-3 py-2"><span>N semis</span><span>{debugSemis}%</span></div>
-                    <div className="flex items-center justify-between rounded-2xl bg-slate-50 px-3 py-2"><span>Cuerpo</span><span>{debugBody}%</span></div>
-                    <div className="flex items-center justify-between rounded-2xl bg-slate-50 px-3 py-2"><span>Total</span><span className="font-semibold">{debugScore}%</span></div>
-                  </div>
-                </CardContent>
-              </Card>
-            </div>
-          </CardContent>
-        </Card>
-
-        <div className="space-y-6">
-          <Card className="rounded-3xl border-0 shadow-xl">
-            <CardHeader className="border-b bg-white"><CardTitle className="text-xl">Resumen por tipo de tarjeta</CardTitle></CardHeader>
-            <CardContent className="space-y-3 p-4">
-              {CARD_PATTERNS.map((card) => (
-                <div key={card.id} className="flex items-center justify-between rounded-2xl bg-slate-50 px-4 py-3">
-                  <div className="text-sm font-medium text-slate-700">{card.label}</div>
-                  <Badge className="rounded-xl text-sm">{totals[card.id] || 0}</Badge>
+      {viewMode === "scanner" ? (
+        <div className="mx-auto grid max-w-7xl gap-6 lg:grid-cols-[1.35fr_0.95fr]">
+          <Card className="overflow-hidden rounded-3xl border-0 shadow-xl">
+            <CardHeader className="border-b bg-white">
+              <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+                <div>
+                  <CardTitle className="flex items-center gap-2 text-2xl">
+                    <Camera className="h-6 w-6" />
+                    Escaner visual · Tropicana Cherry
+                  </CardTitle>
+                  <p className="mt-2 text-sm text-slate-600">Comparacion por plantillas reales, sin OCR. Si no coincide con una foto valida, se descarta.</p>
                 </div>
-              ))}
+                <div className="flex flex-wrap gap-2">
+                  <Button onClick={() => void startCamera()} disabled={!templatesReady || cameraReady} variant="outline" className="rounded-2xl">
+                    <Play className="mr-2 h-4 w-4" />
+                    Reintentar camara
+                  </Button>
+                  <Button variant="outline" className="rounded-2xl" onClick={() => fileInputRef.current?.click()} disabled={isProcessingImage || !templatesReady}>
+                    <Upload className="mr-2 h-4 w-4" />
+                    Subir imagen
+                  </Button>
+                  <input ref={fileInputRef} type="file" accept="image/*" className="hidden" onChange={handleImageUpload} />
+                </div>
+              </div>
+            </CardHeader>
+
+            <CardContent className="space-y-4 p-4 md:p-6">
+              <div className="grid gap-4 md:grid-cols-3">
+                <Card className="rounded-3xl border-slate-200 shadow-sm md:col-span-2">
+                  <CardContent className="p-4">
+                    <div className="relative overflow-hidden rounded-3xl bg-slate-900">
+                      <video ref={videoRef} className="aspect-video w-full object-cover" autoPlay muted playsInline />
+                      <div className="pointer-events-none absolute inset-0 flex items-center justify-center p-6">
+                        <div className={`relative w-full max-w-md rounded-[2rem] border-4 shadow-[0_0_0_9999px_rgba(0,0,0,0.28)] transition-all duration-150 ${isFeedbackOn ? "scale-105 border-lime-300 bg-lime-200/10" : "border-emerald-400/80"}`}>
+                          <div className="absolute left-0 right-0 top-1/2 h-0.5 -translate-y-1/2 bg-emerald-300/90" />
+                        </div>
+                      </div>
+                      {isFeedbackOn ? <div className="absolute right-3 top-3 rounded-xl bg-lime-400 px-3 py-1.5 text-xs font-bold text-slate-900">DETECTADO</div> : null}
+                      <div className="absolute bottom-3 left-3 right-3 rounded-2xl bg-black/55 px-4 py-3 text-sm text-white backdrop-blur-sm">
+                        <div className="flex items-center gap-2 font-medium">
+                          <ScanLine className="h-4 w-4" />
+                          Estado
+                        </div>
+                        <div className="mt-1 text-white/90">{status}</div>
+                      </div>
+                    </div>
+                  </CardContent>
+                </Card>
+
+                <Card className="rounded-3xl border-slate-200 shadow-sm">
+                  <CardContent className="space-y-3 p-4">
+                    <div className="text-sm font-semibold text-slate-700">Entorno</div>
+                    <div className="space-y-2 text-sm text-slate-600">
+                      <div className="flex items-center justify-between rounded-2xl bg-slate-50 px-3 py-2"><span>Plantillas</span><Badge variant={templatesReady ? "default" : "destructive"} className="rounded-xl">{templates.length}</Badge></div>
+                      <div className="flex items-center justify-between rounded-2xl bg-slate-50 px-3 py-2"><span>HTTPS / localhost</span><Badge variant={secureContext ? "default" : "destructive"} className="rounded-xl">{secureContext ? "Si" : "No"}</Badge></div>
+                      <div className="flex items-center justify-between rounded-2xl bg-slate-50 px-3 py-2"><span>Permiso camara</span><Badge variant={permissionState === "granted" ? "default" : permissionState === "denied" ? "destructive" : "secondary"} className="rounded-xl">{permissionState}</Badge></div>
+                      <div className="flex items-center justify-between rounded-2xl bg-slate-50 px-3 py-2"><span>Score total</span><Badge variant={debugScore >= 60 ? "default" : "secondary"} className="rounded-xl">{debugScore}%</Badge></div>
+                    </div>
+
+                    {lastError ? (
+                      <div className="rounded-2xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900">
+                        <div className="flex items-start gap-2 font-medium"><ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" />Problema detectado</div>
+                        <div className="mt-2 leading-6">{lastError}</div>
+                      </div>
+                    ) : null}
+
+                    <div>
+                      <div className="text-sm font-semibold text-slate-700">Ultima deteccion</div>
+                      <div className="mt-2 min-h-20 rounded-2xl bg-slate-50 p-3 text-sm">
+                        {currentMatch ? <div className="flex items-start gap-2 text-emerald-700"><CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0" /><span>{currentMatch}</span></div> : <div className="flex items-start gap-2 text-slate-500"><AlertCircle className="mt-0.5 h-4 w-4 shrink-0" /><span>Aun no hay deteccion valida.</span></div>}
+                      </div>
+                    </div>
+
+                    <div><div className="text-sm font-semibold text-slate-700">Total escaneos</div><div className="mt-1 text-3xl font-bold tracking-tight text-slate-900">{totalScans}</div></div>
+                  </CardContent>
+                </Card>
+              </div>
+
+              <div className="grid gap-4 md:grid-cols-3">
+                <Card className="rounded-3xl border-slate-200 shadow-sm md:col-span-2">
+                  <CardContent className="p-4">
+                    <div className="mb-3 flex items-center justify-between">
+                      <div className="text-sm font-semibold text-slate-700">Escaneo rapido anti-falsos</div>
+                      <Badge variant="secondary" className="rounded-xl px-3 py-1">{isRunning ? "Auto activo" : "Esperando camara"}</Badge>
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      <Button onClick={clearHistory} variant="outline" className="rounded-2xl"><Trash2 className="mr-2 h-4 w-4" />Limpiar lista</Button>
+                      <Button onClick={copySummary} variant="outline" className="rounded-2xl"><Copy className="mr-2 h-4 w-4" />Copiar resumen</Button>
+                    </div>
+                    <div className="mt-4 rounded-2xl bg-emerald-50 px-4 py-3 text-sm text-emerald-900">Compara titulo + cuerpo + fila de semis y da peso fuerte a la casilla del numero del pack. Solo cuenta con 2-3 lecturas seguidas segun confianza.</div>
+                  </CardContent>
+                </Card>
+
+                <Card className="rounded-3xl border-slate-200 shadow-sm">
+                  <CardContent className="p-4">
+                    <div className="text-sm font-semibold text-slate-700">Debug detector</div>
+                    <div className="mt-3 space-y-2 text-sm text-slate-700">
+                      <div className="flex items-center justify-between rounded-2xl bg-slate-50 px-3 py-2"><span>Mejor plantilla</span><span className="font-semibold">{debugBest}</span></div>
+                      <div className="flex items-center justify-between rounded-2xl bg-slate-50 px-3 py-2"><span>Titulo</span><span>{debugTitle}%</span></div>
+                      <div className="flex items-center justify-between rounded-2xl bg-slate-50 px-3 py-2"><span>N semis</span><span>{debugSemis}%</span></div>
+                      <div className="flex items-center justify-between rounded-2xl bg-slate-50 px-3 py-2"><span>Numero pack</span><span>{debugNumber}%</span></div>
+                      <div className="flex items-center justify-between rounded-2xl bg-slate-50 px-3 py-2"><span>Cuerpo</span><span>{debugBody}%</span></div>
+                      <div className="flex items-center justify-between rounded-2xl bg-slate-50 px-3 py-2"><span>Total</span><span className="font-semibold">{debugScore}%</span></div>
+                    </div>
+                  </CardContent>
+                </Card>
+              </div>
+            </CardContent>
+          </Card>
+
+          <div className="space-y-6">
+            <Card className="rounded-3xl border-0 shadow-xl">
+              <CardHeader className="border-b bg-white"><CardTitle className="text-xl">Resumen por tipo de tarjeta</CardTitle></CardHeader>
+              <CardContent className="space-y-3 p-4">
+                {CARD_PATTERNS.map((card) => (
+                  <div key={card.id} className="flex items-center justify-between rounded-2xl bg-slate-50 px-4 py-3">
+                    <div className="text-sm font-medium text-slate-700">{card.label}</div>
+                    <Badge className="rounded-xl text-sm">{totals[card.id] || 0}</Badge>
+                  </div>
+                ))}
+              </CardContent>
+            </Card>
+
+            <Card className="rounded-3xl border-0 shadow-xl">
+              <CardHeader className="border-b bg-white">
+                <div className="flex items-center justify-between gap-3">
+                  <CardTitle className="text-xl">Lista de lo escaneado</CardTitle>
+                  <Button size="sm" variant="ghost" onClick={() => setHistory((prev) => prev.slice(1))} className="rounded-2xl"><RotateCcw className="mr-2 h-4 w-4" />Quitar ultimo</Button>
+                </div>
+              </CardHeader>
+              <CardContent className="p-0">
+                <ScrollArea className="h-[320px]">
+                  <div className="divide-y">
+                    {history.length === 0 ? (
+                      <div className="p-5 text-sm text-slate-500">Todavia no hay lecturas validas.</div>
+                    ) : (
+                      history.map((item, index) => (
+                        <div key={`${item.timestamp}-${index}`} className="p-4">
+                          <div className="flex items-start justify-between gap-3">
+                            <div>
+                              <div className="font-semibold text-slate-900">{item.label}</div>
+                              <div className="mt-1 text-xs text-slate-500">{item.timestamp} - fuente: {item.source === "camera" ? "camara" : "imagen"} - score: {item.score}%</div>
+                            </div>
+                            <Badge variant="secondary" className="rounded-xl">#{history.length - index}</Badge>
+                          </div>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </ScrollArea>
+              </CardContent>
+            </Card>
+
+            <Card className="rounded-3xl border-0 shadow-xl">
+              <CardHeader className="border-b bg-white"><CardTitle className="flex items-center gap-2 text-xl"><Zap className="h-5 w-5" />Modo de deteccion</CardTitle></CardHeader>
+              <CardContent className="p-4 text-sm leading-6 text-slate-700">Este modo usa comparacion visual contra tus fotos de packs. Si no coincide con plantilla, se descarta.</CardContent>
+            </Card>
+          </div>
+        </div>
+      ) : (
+        <div className="mx-auto grid max-w-7xl gap-6 lg:grid-cols-[1.35fr_0.95fr]">
+          <Card className="overflow-hidden rounded-3xl border-0 shadow-xl">
+            <CardHeader className="border-b bg-white">
+              <CardTitle className="text-2xl">Entrenamiento de plantillas</CardTitle>
+              <p className="mt-2 text-sm text-slate-600">Guarda fotos reales por tipo de pack para aumentar precision y reducir falsas detecciones.</p>
+            </CardHeader>
+            <CardContent className="space-y-4 p-4 md:p-6">
+              <div className="grid gap-4 md:grid-cols-3">
+                <Card className="rounded-3xl border-slate-200 shadow-sm md:col-span-2">
+                  <CardContent className="p-4">
+                    <div className="relative overflow-hidden rounded-3xl bg-slate-900">
+                      <video ref={videoRef} className="aspect-video w-full object-cover" autoPlay muted playsInline />
+                      <div className="pointer-events-none absolute inset-0 flex items-center justify-center p-6">
+                        <div className="relative w-full max-w-md rounded-[2rem] border-4 border-cyan-300/80 shadow-[0_0_0_9999px_rgba(0,0,0,0.28)]">
+                          <div className="absolute left-0 right-0 top-1/2 h-0.5 -translate-y-1/2 bg-cyan-200/90" />
+                        </div>
+                      </div>
+                      <div className="absolute bottom-3 left-3 right-3 rounded-2xl bg-black/55 px-4 py-3 text-sm text-white backdrop-blur-sm">{status}</div>
+                    </div>
+                  </CardContent>
+                </Card>
+
+                <Card className="rounded-3xl border-slate-200 shadow-sm">
+                  <CardContent className="space-y-3 p-4">
+                    <div className="text-sm font-semibold text-slate-700">Nuevo ejemplo</div>
+                    <label className="text-xs font-medium uppercase tracking-wide text-slate-500">Tipo de pack</label>
+                    <select
+                      value={selectedTrainingCardId}
+                      onChange={(event) => setSelectedTrainingCardId(event.target.value)}
+                      className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700"
+                    >
+                      {CARD_PATTERNS.map((card) => (
+                        <option key={card.id} value={card.id}>{card.label}</option>
+                      ))}
+                    </select>
+
+                    <div className="grid gap-2">
+                      <Button className="rounded-2xl" onClick={captureTrainingFromCamera} disabled={!cameraReady}>
+                        <Camera className="mr-2 h-4 w-4" />
+                        Hacer foto de entrenamiento
+                      </Button>
+                      <Button variant="outline" className="rounded-2xl" onClick={() => trainingFileInputRef.current?.click()} disabled={isProcessingImage}>
+                        <Upload className="mr-2 h-4 w-4" />
+                        Subir foto de entrenamiento
+                      </Button>
+                      <input ref={trainingFileInputRef} type="file" accept="image/*" className="hidden" onChange={handleTrainingUpload} />
+                    </div>
+
+                    <div className="rounded-2xl bg-cyan-50 px-3 py-2 text-xs leading-5 text-cyan-900">
+                      Haz varias fotos por pack con diferentes luces y angulos para que el detector sea mas robusto.
+                    </div>
+                  </CardContent>
+                </Card>
+              </div>
+
+              <div className="grid gap-4 md:grid-cols-2">
+                <Card className="rounded-3xl border-slate-200 shadow-sm">
+                  <CardContent className="p-4">
+                    <div className="mb-3 text-sm font-semibold text-slate-700">Muestras por tipo</div>
+                    <div className="space-y-2">
+                      {CARD_PATTERNS.map((card) => (
+                        <div key={card.id} className="flex items-center justify-between rounded-2xl bg-slate-50 px-3 py-2">
+                          <span className="text-sm text-slate-700">{card.label}</span>
+                          <Badge className="rounded-xl">{trainingTotals[card.id] || 0}</Badge>
+                        </div>
+                      ))}
+                    </div>
+                  </CardContent>
+                </Card>
+
+                <Card className="rounded-3xl border-slate-200 shadow-sm">
+                  <CardContent className="p-4">
+                    <div className="mb-3 text-sm font-semibold text-slate-700">Gestion</div>
+                    <div className="grid gap-2">
+                      <Button variant="outline" className="rounded-2xl" onClick={() => clearTrainingByCard(selectedTrainingCardId)} disabled={!selectedTrainingCardId}>
+                        <Trash2 className="mr-2 h-4 w-4" />
+                        Borrar entrenamiento del pack seleccionado
+                      </Button>
+                      <Button variant="outline" className="rounded-2xl" onClick={clearAllTraining} disabled={trainingSamples.length === 0}>
+                        <Trash2 className="mr-2 h-4 w-4" />
+                        Borrar todo el entrenamiento
+                      </Button>
+                    </div>
+                  </CardContent>
+                </Card>
+              </div>
             </CardContent>
           </Card>
 
           <Card className="rounded-3xl border-0 shadow-xl">
-            <CardHeader className="border-b bg-white">
-              <div className="flex items-center justify-between gap-3">
-                <CardTitle className="text-xl">Lista de lo escaneado</CardTitle>
-                <Button size="sm" variant="ghost" onClick={() => setHistory((prev) => prev.slice(1))} className="rounded-2xl"><RotateCcw className="mr-2 h-4 w-4" />Quitar ultimo</Button>
-              </div>
-            </CardHeader>
+            <CardHeader className="border-b bg-white"><CardTitle className="text-xl">Galeria de entrenamiento</CardTitle></CardHeader>
             <CardContent className="p-0">
-              <ScrollArea className="h-[320px]">
+              <ScrollArea className="h-[620px]">
                 <div className="divide-y">
-                  {history.length === 0 ? (
-                    <div className="p-5 text-sm text-slate-500">Todavia no hay lecturas validas.</div>
+                  {trainingSamplesSorted.length === 0 ? (
+                    <div className="p-5 text-sm text-slate-500">No hay muestras guardadas todavia.</div>
                   ) : (
-                    history.map((item, index) => (
-                      <div key={`${item.timestamp}-${index}`} className="p-4">
-                        <div className="flex items-start justify-between gap-3">
-                          <div>
-                            <div className="font-semibold text-slate-900">{item.label}</div>
-                            <div className="mt-1 text-xs text-slate-500">{item.timestamp} - fuente: {item.source === "camera" ? "camara" : "imagen"} - score: {item.score}%</div>
+                    trainingSamplesSorted.map((sample) => {
+                      const card = CARD_PATTERNS.find((item) => item.id === sample.cardId);
+                      return (
+                        <div key={sample.id} className="flex items-center gap-3 p-4">
+                          <img src={sample.dataUrl} alt={card?.label || sample.cardId} className="h-16 w-12 rounded-lg border border-slate-200 object-cover" loading="lazy" />
+                          <div className="min-w-0 flex-1">
+                            <div className="truncate text-sm font-semibold text-slate-900">{card?.label || sample.cardId}</div>
+                            <div className="text-xs text-slate-500">{new Date(sample.createdAt).toLocaleString()}</div>
                           </div>
-                          <Badge variant="secondary" className="rounded-xl">#{history.length - index}</Badge>
+                          <Button size="sm" variant="ghost" className="rounded-xl" onClick={() => deleteTrainingSample(sample.id)}>
+                            <Trash2 className="h-4 w-4" />
+                          </Button>
                         </div>
-                      </div>
-                    ))
+                      );
+                    })
                   )}
                 </div>
               </ScrollArea>
             </CardContent>
           </Card>
-
-          <Card className="rounded-3xl border-0 shadow-xl">
-            <CardHeader className="border-b bg-white"><CardTitle className="flex items-center gap-2 text-xl"><Zap className="h-5 w-5" />Modo de deteccion</CardTitle></CardHeader>
-            <CardContent className="p-4 text-sm leading-6 text-slate-700">Este modo usa comparacion visual contra tus fotos de packs. Si no coincide con plantilla, se descarta.</CardContent>
-          </Card>
         </div>
-      </div>
+      )}
 
       <canvas ref={cardCanvasRef} className="hidden" />
     </div>
