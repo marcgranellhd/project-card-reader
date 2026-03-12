@@ -13,6 +13,22 @@ services:
     image: caddy:2.8-alpine
     depends_on:
       - card-reader
+    command: >
+      sh -c '
+      {
+        if [ -n "$LETSENCRYPT_EMAIL" ]; then
+          echo "{";
+          echo "  email $LETSENCRYPT_EMAIL";
+          echo "}";
+          echo;
+        fi;
+        echo "$APP_DOMAIN {";
+        echo "  encode zstd gzip";
+        echo "  reverse_proxy card-reader:80";
+        echo "}";
+      } > /etc/caddy/Caddyfile;
+      exec caddy run --config /etc/caddy/Caddyfile --adapter caddyfile
+      '
     ports:
       - "0.0.0.0:${APP_HTTP_PORT:-8088}:80"
       - "0.0.0.0:${APP_HTTPS_PORT:-8443}:443"
@@ -20,7 +36,6 @@ services:
       - APP_DOMAIN=${APP_DOMAIN:-reader.marcgrabel.cc}
       - LETSENCRYPT_EMAIL=${LETSENCRYPT_EMAIL:-}
     volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config
     networks:

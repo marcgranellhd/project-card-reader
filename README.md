@@ -71,6 +71,10 @@ Desde la red local: `http://TU_IP_LOCAL:5173`.
 5. Deploy stack.
 6. Entrar por `https://APP_DOMAIN:APP_HTTPS_PORT`.
 
+Nota Portainer:
+
+- Este compose ya no usa bind mount de `./Caddyfile`, para evitar errores tipo `read-only file system` en `/data/compose/...`.
+
 Importante para camara en movil:
 
 - La camara solo funciona en contexto seguro: `https://` o `localhost`.
