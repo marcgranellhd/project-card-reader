@@ -108,10 +108,18 @@ type OcrWorker = Awaited<ReturnType<typeof Tesseract.createWorker>>;
 
 function normalizeCommonOcrTypos(text: string) {
   return normalizeText(text)
+    .replace(/\btropieana\b/g, "tropicana")
+    .replace(/\btroplcana\b/g, "tropicana")
+    .replace(/\btropicana\b/g, "tropicana")
     .replace(/\bcherrv\b/g, "cherry")
     .replace(/\bchery\b/g, "cherry")
-    .replace(/\btropicana\b/g, "tropicana")
-    .replace(/\btropieana\b/g, "tropicana");
+    .replace(/\bcherr\b/g, "cherry")
+    .replace(/\bcherny\b/g, "cherry")
+    .replace(/\bcheriy\b/g, "cherry")
+    .replace(/\bsernis\b/g, "semis")
+    .replace(/\bsenis\b/g, "semis")
+    .replace(/\bsemi5\b/g, "semis")
+    .replace(/\b5emis\b/g, "semis");
 }
 
 function normalizeAmbiguousNumbers(text: string) {
@@ -119,7 +127,8 @@ function normalizeAmbiguousNumbers(text: string) {
 
   return tokens
     .map((token) => {
-      if (!/[a-z]/.test(token) || !/\d/.test(token)) return token;
+      if (!/\d/.test(token)) return token;
+      if (!/^[0-9oilsbzx]+$/.test(token)) return token;
 
       return token
         .replace(/o/g, "0")
@@ -129,6 +138,27 @@ function normalizeAmbiguousNumbers(text: string) {
         .replace(/z/g, "2");
     })
     .join(" ");
+}
+
+function normalizeOcrWordToken(token: string) {
+  return token
+    .replace(/rn/g, "m")
+    .replace(/0/g, "o")
+    .replace(/[1l]/g, "i")
+    .replace(/5/g, "s");
+}
+
+function isSemisLikeToken(token: string) {
+  const cleaned = normalizeOcrWordToken(token).replace(/[^a-z]/g, "");
+  return cleaned.startsWith("semi") || cleaned.startsWith("semilla");
+}
+
+function parsePackToken(token: string): number | null {
+  const normalized = normalizeAmbiguousNumbers(token).replace(/[^0-9]/g, "");
+  if (!normalized) return null;
+  const value = Number(normalized);
+  if (value === 3 || value === 5 || value === 10 || value === 25 || value === 100) return value;
+  return null;
 }
 
 function enhanceImageForOCR(ctx: CanvasRenderingContext2D, width: number, height: number) {
@@ -163,37 +193,56 @@ function normalizeText(text: string) {
 
 function includesTropicanaCherry(text: string) {
   const normalized = normalizeCommonOcrTypos(normalizeAmbiguousNumbers(text));
-  return normalized.includes("tropicana") && normalized.includes("cherry");
+  const tokens = normalized.split(" ").map((token) => normalizeOcrWordToken(token));
+  const hasTropicana = tokens.some((token) => token.includes("tropicana") || (token.startsWith("tropi") && token.endsWith("ana")));
+  const hasCherry = tokens.some((token) => token.includes("cherry") || token.includes("chery") || token.includes("cherri"));
+  return hasTropicana && hasCherry;
 }
 
 function parseSemisPack(text: string): number | null {
   const normalized = normalizeCommonOcrTypos(normalizeAmbiguousNumbers(text));
   if (!normalized) return null;
 
-  const allowed = new Set(["3", "5", "10", "25", "100"]);
-
   const directPatterns = [
     /(?:n\s*(?:o|0|ro)?\s*)?(?:semis|semi|semilla|semillas)\s*(?:de|:)?\s*(3|5|10|25|100)\b/,
     /(?:3|5|10|25|100)\s*(?:semis|semi|semilla|semillas)\b/,
+    /\bn\s*(?:o|0|ro)?\s*[:\-]?\s*(3|5|10|25|100)\b/,
   ];
 
   for (const pattern of directPatterns) {
     const found = normalized.match(pattern);
-    if (found?.[1]) return Number(found[1]);
+    if (found?.[1]) {
+      const parsed = parsePackToken(found[1]);
+      if (parsed) return parsed;
+    }
     if (found?.[0]) {
       const num = found[0].match(/\b(3|5|10|25|100)\b/);
-      if (num?.[1]) return Number(num[1]);
+      if (num?.[1]) {
+        const parsed = parsePackToken(num[1]);
+        if (parsed) return parsed;
+      }
     }
   }
 
   const tokens = normalized.split(" ").filter(Boolean);
-  const semisIndex = tokens.findIndex((token) => token.startsWith("semi"));
-  if (semisIndex === -1) return null;
+  const semisIndex = tokens.findIndex((token) => isSemisLikeToken(token));
+  if (semisIndex !== -1) {
+    const from = Math.max(0, semisIndex - 5);
+    const to = Math.min(tokens.length - 1, semisIndex + 5);
+    for (let i = from; i <= to; i += 1) {
+      const parsed = parsePackToken(tokens[i]);
+      if (parsed) return parsed;
+    }
+  }
 
-  const from = Math.max(0, semisIndex - 4);
-  const to = Math.min(tokens.length - 1, semisIndex + 4);
-  for (let i = from; i <= to; i += 1) {
-    if (allowed.has(tokens[i])) return Number(tokens[i]);
+  const foundAll = tokens
+    .map((token) => parsePackToken(token))
+    .filter((value): value is number => value !== null);
+
+  const hasIndexMarker = tokens.some((token) => ["n", "no", "n0", "nro", "numero"].includes(token));
+
+  if (foundAll.length === 1 && hasIndexMarker) {
+    return foundAll[0];
   }
 
   return null;
@@ -286,6 +335,8 @@ export default function TropicanaCardScannerWeb() {
   const [isProcessingImage, setIsProcessingImage] = useState(false);
   const [ocrConfidence, setOcrConfidence] = useState<number | null>(null);
   const [isFeedbackOn, setIsFeedbackOn] = useState(false);
+  const [debugHasBrand, setDebugHasBrand] = useState(false);
+  const [debugPack, setDebugPack] = useState<number | null>(null);
 
   const totals = useMemo(() => {
     return history.reduce<Record<string, number>>((acc, item) => {
@@ -422,6 +473,10 @@ export default function TropicanaCardScannerWeb() {
     const cleanText = text.trim();
     setRecognizedText(cleanText);
     setOcrConfidence(typeof confidence === "number" ? Math.round(confidence) : null);
+    const hasBrand = includesTropicanaCherry(cleanText);
+    const packFromSemis = parseSemisPack(cleanText);
+    setDebugHasBrand(hasBrand);
+    setDebugPack(packFromSemis);
 
     const match = detectCard(cleanText);
     if (match) {
@@ -430,6 +485,10 @@ export default function TropicanaCardScannerWeb() {
       setCurrentMatch(null);
       if (!cleanText) {
         setStatus(source === "camera" ? "Escaneando... sin texto legible, acerca la tarjeta y mejora la luz." : "La imagen no tiene texto legible para OCR.");
+      } else if (!hasBrand) {
+        setStatus("Leo texto, pero no aparece “Tropicana Cherry” con claridad.");
+      } else if (!packFromSemis) {
+        setStatus("Veo Tropicana Cherry, pero no logro leer el número de “Nº semis”.");
       } else {
         setStatus(source === "camera" ? "Escaneando... todavía no veo una tarjeta reconocible." : "La imagen se leyó, pero no coincide con ninguna tarjeta conocida.");
       }
@@ -562,6 +621,8 @@ export default function TropicanaCardScannerWeb() {
     setCurrentMatch(null);
     setRecognizedText("");
     setOcrConfidence(null);
+    setDebugHasBrand(false);
+    setDebugPack(null);
     setLastError(null);
     setStatus("Lista limpiada. Puedes volver a escanear.");
   };
@@ -703,6 +764,14 @@ export default function TropicanaCardScannerWeb() {
                       <div className="flex items-center justify-between rounded-2xl bg-slate-50 px-3 py-2">
                         <span>Confianza OCR</span>
                         <Badge variant="secondary" className="rounded-xl">{ocrConfidence !== null ? `${ocrConfidence}%` : "--"}</Badge>
+                      </div>
+                      <div className="flex items-center justify-between rounded-2xl bg-slate-50 px-3 py-2">
+                        <span>Tropicana Cherry</span>
+                        <Badge variant={debugHasBrand ? "default" : "secondary"} className="rounded-xl">{debugHasBrand ? "Sí" : "No"}</Badge>
+                      </div>
+                      <div className="flex items-center justify-between rounded-2xl bg-slate-50 px-3 py-2">
+                        <span>Pack semis detectado</span>
+                        <Badge variant={debugPack ? "default" : "secondary"} className="rounded-xl">{debugPack ?? "--"}</Badge>
                       </div>
                     </div>
                   </div>
