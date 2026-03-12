@@ -1,4 +1,4 @@
-# Project Card Reader
+﻿# Project Card Reader
 
 App web para escanear tarjetas usando camara + OCR (Tesseract.js).
 
@@ -31,7 +31,7 @@ Este stack incluye Caddy para HTTPS automatico.
 2. Configurar variables:
 
 ```env
-APP_DOMAIN=cards.tudominio.com
+APP_DOMAIN=reader.marcgrabel.cc
 LETSENCRYPT_EMAIL=tu-correo@tudominio.com
 ```
 
@@ -45,7 +45,7 @@ LETSENCRYPT_EMAIL=tu-correo@tudominio.com
 docker compose up --build -d
 ```
 
-5. Abrir `https://cards.tudominio.com`.
+5. Abrir `https://reader.marcgrabel.cc`.
 
 ## Modo desarrollo en contenedor
 
@@ -70,5 +70,6 @@ Desde la red local: `http://TU_IP_LOCAL:5173`.
 Importante para camara en movil:
 
 - La camara solo funciona en contexto seguro: `https://` o `localhost`.
-- En movil, usa certificado valido (Let�s Encrypt). Un certificado no confiable puede bloquear permisos de camara.
+- En movil, usa certificado valido (Let’s Encrypt). Un certificado no confiable puede bloquear permisos de camara.
 - Si solo usas IP local (`http://192.168.x.x`) el navegador movil bloqueara `getUserMedia`.
+
